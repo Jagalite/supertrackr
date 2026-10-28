@@ -1,0 +1,14 @@
+socket_workers = 1
+swarm_workers = 1
+log_level = "warn"
+[network]
+use_ipv4 = true
+use_ipv6 = false
+address_ipv4 = "127.0.0.1:8445"
+enable_tls = false
+keep_alive = true
+[protocol]
+max_peers = 1
+peer_announce_interval = 120
+[cleaning]
+max_peer_age = 300
