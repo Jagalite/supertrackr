@@ -1327,6 +1327,14 @@ version = "0.2.0"
 source = "git+https://github.com/Jagalite/statelessness?rev=0876717bee85e335449c2c99ada41f6c6e6112d1#0876717bee85e335449c2c99ada41f6c6e6112d1"
 
 [[package]]
+name = "statelessness-debug"
+version = "0.2.0"
+source = "git+https://github.com/Jagalite/statelessness?rev=0876717bee85e335449c2c99ada41f6c6e6112d1#0876717bee85e335449c2c99ada41f6c6e6112d1"
+dependencies = [
+ "statelessness",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,6 +1365,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "statelessness",
+ "statelessness-debug",
  "subtle",
  "tokio",
  "tower",

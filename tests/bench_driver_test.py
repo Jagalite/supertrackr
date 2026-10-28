@@ -13,7 +13,7 @@ DRIVER = Path(__file__).resolve().parents[1] / 'scripts/bench.py'
 FAKE = '''import os, socket, sys, time
 from pathlib import Path
 name=Path(sys.argv[0]).name
-if name=='echo':
+if name in ('echo','supertrackr'):
     host,port=sys.argv[sys.argv.index('--listen')+1].rsplit(':',1)
     sock=socket.socket();sock.bind((host,int(port)));sock.listen()
 Path(sys.argv[0]).with_suffix('.pid').write_text(str(os.getpid()))
@@ -33,13 +33,24 @@ class DriverTests(unittest.TestCase):
         return root
 
     def test_invalid_settings_rejected_before_process_launch(self):
-        for args in [['--rate','0'],['--modes','old-lookup'],['--population','1'],['--peer-limit','0']]:
+        for args in [['--rate','0'],['--modes','old-lookup'],['--population','1'],['--peer-limit','0'],['--ttl-seconds','0'],['--population','1000001']]:
             with tempfile.TemporaryDirectory() as base:
                 root=self.workspace(base)
                 run=subprocess.run([sys.executable,str(root/'scripts/bench.py'),*args],capture_output=True,timeout=5)
                 self.assertEqual(run.returncode,2)
                 self.assertFalse(list(root.rglob('*.pid')))
                 self.assertFalse((root/'bench/results').exists())
+
+    def test_large_generator_output_cannot_block_completion(self):
+        with tempfile.TemporaryDirectory() as base:
+            root=self.workspace(base)
+            load=root/'target/release/load'
+            load.write_text(f'#!{sys.executable}\n' + 'import sys\nprint("x" * 262144)\nprint("y" * 262144, file=sys.stderr)\nprint(\'{"passed": true}\')\n')
+            run=subprocess.run([sys.executable,str(root/'scripts/bench.py'),'--modes','verify'],capture_output=True,timeout=10)
+            self.assertEqual(run.returncode,0,run.stderr)
+            outputs=list((root/'bench/results').rglob('*.stdout'))
+            self.assertEqual(len(outputs),2)
+            self.assertTrue(all(p.stat().st_size > 262144 for p in outputs))
 
     def test_interrupt_reaps_server_and_generator(self):
         for sig in [signal.SIGINT,signal.SIGTERM]:

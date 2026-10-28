@@ -36,11 +36,16 @@ for invalid in [False, True]:
             '--population', '2', '--workers', '1'], capture_output=True, text=True,
             env=dict(os.environ, TOKIO_WORKER_THREADS='2'), timeout=20)
         result = json.loads(run.stdout)
-        assert result['offered'] == result['accepted'] == 10, result
-        assert result['success'] == (0 if invalid else 10), result
-        assert result['errors'] == (10 if invalid else 0), result
-        assert run.returncode == (2 if invalid else 0), result
-        print('PASS', 'reject wrong peer key' if invalid else 'valid persistent HTTP responses')
+        accepted = result['accepted']
+        assert result['offered'] == 10 and 0 < accepted <= 10, result
+        assert accepted + result['late'] == 10, result
+        assert result['queue_dropped'] == result['channel_closed'] == 0, result
+        assert result['success'] == (0 if invalid else accepted), result
+        assert result['errors'] == (accepted if invalid else 0), result
+        assert result['passed'] == (not invalid and accepted == 10), result
+        assert run.returncode == (2 if invalid or accepted != 10 else 0), result
+        print('PASS functional validation:', 'reject wrong peer key' if invalid else 'valid persistent HTTP responses',
+              f"({accepted}/10 sent; {result['late']} late offers; not a performance gate)")
     finally:
         server.shutdown()
         server.server_close()

@@ -27,3 +27,6 @@ tower = { version = "0.5", features = ["limit", "util"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+statelessness-debug = { git = "https://github.com/Jagalite/statelessness", rev = "0876717bee85e335449c2c99ada41f6c6e6112d1" }

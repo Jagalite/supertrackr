@@ -28,16 +28,16 @@ of reachability or ownership of that address.
 
 `GET /v1/peers?limit=20` authenticates the caller and returns active registrations'
 public keys, endpoints, and remaining lifetimes, excluding the caller. The list
-limit is 1–100. Selection rotates the initial shard and a cursor within each shard, examines at most 4,096 records,
-and returns at most the requested count. The compact per-shard key index prevents permanent exclusion of a fixed suffix.
+limit is 1–100. Selection advances a registry-owned cursor, examines at most 4,096 records,
+and returns at most the requested count. The compact key index prevents permanent exclusion of a fixed suffix.
 It is a bounded sample, not complete pagination or a uniformly random sample. It may return fewer peers after concurrent
 expiry or when its examination budget is exhausted.
 
-Each returned record is checked alongside the caller under ordered shared shard locks;
-the caller is also checked before returning. A list is not a global atomic
-snapshot, and metadata can become stale immediately after a check. Clients must
-refresh discovery or verify a new binding when appropriate. No peer maps are
-continuously synchronized.
+Each command executes sequentially against the exclusively owned registry. Caller
+and returned peers are checked at the same processing timestamp without storage
+locks or interleaved mutations. Metadata can still become stale immediately after
+execution. Clients must refresh discovery or verify a new binding when appropriate.
+No peer maps are continuously synchronized.
 
 ## Verify peer
 
@@ -61,28 +61,41 @@ have been removed. `/health` remains a process-liveness endpoint.
 
 ## State, policy and limits
 
-The host has 64 randomized hash shards protected by read/write locks, compact
-binary keys, constant-time token hash comparisons, and a global registration
-capacity. Verification and discovery use shared locks. Creation, refresh and
-cleanup use exclusive locks. The sampling cursors use atomics, and discovery
-checks multiple peers during one ordered shard-pair visit rather than reacquiring
-locks per peer. Concurrent samples may overlap; one response has no duplicate keys.
+`core::Registry` exclusively owns a hash map, discovery key vector, cursor and
+configuration. Its synchronous methods take an explicit timestamp and contain no
+locks, atomics, channels, clocks or I/O. There is no whole-registry cloning. The
+record count comes directly from the owned map.
 
-Token parsing, new-token randomness/hashing, and response encoding happen outside
-write critical sections. No lock crosses an await. Pair checks lock in a consistent
-order and observe the caller and target records together. This remains a synchronized
-host, not a lock-free server. Read/write locks permit concurrent readers, but their
-performance and writer scheduling depend on the workload and platform.
+`coordinator::Coordinator` is a command handle. A single spawned Tokio task owns
+the registry and processes registration, refresh, discovery, verification, count
+and cleanup commands. It supplies current processing time, not enqueue time.
+The command channel is currently unbounded, distinct from load-generator queues.
+Messages and one-shot replies synchronize callers; the registry itself is never
+shared. The owner serializes all operations and maintenance. Periodic cleanup checks
+at most 4,096 entries per batch, removes expired index entries with swap removal,
+and resets its 20 ms timer after completion. Requests run between batches. The
+explicit full-cleanup command remains available for tests and maintenance callers;
+it can still pause the owner for a complete scan.
 
-Statelessness models creation, refresh, expiry and access decisions. The access
-model consumes a caller lease, host-supplied credential-match fact, target binding,
-claimed endpoint and timestamp. Authentication failure takes precedence over all
-target decisions. Discovery and verification share this policy. Decisions are
-recomputed for each observation and never retained as authorization grants.
-The core performs no I/O, randomness, cryptography or synchronization, and does
-not prove the entire concurrent host.
-Cleanup scans shards every five seconds. Expired entries fail validity checks
-immediately, even before cleanup. Restart clears registrations and credentials.
+Dropping all sender handles closes the task after queued commands are handled.
+A reply already cancelled when dequeued causes that operation to be skipped;
+cancellation after execution starts does not roll back mutations. Owner loss maps
+to an unavailable response. A Tokio runtime is required to create the command handle;
+the registry can also be tested directly without one.
+
+HTTP adapters parse/encode transport data and generate/hash new token material.
+The registry handles admission, storage, constant-time credential-hash comparison
+and model decisions. Statelessness models creation, refresh, expiry and access
+policy. Inputs contain leases, authentication facts, target bindings, claims and
+explicit time. No decision is retained as a cached authorization grant. The pure
+models contain no I/O, cryptography or synchronization and do not establish a proof
+of the entire runtime.
+Cleanup advances a separate cursor through the discovery index. Total reclamation
+time depends on population and load; expiry checks reject access immediately, before
+physical removal. Storage for the configured capacity is reserved during startup
+to avoid growth reallocations during the initial fill. Lease eligibility uses the same
+allocation-free predicate in the model and cleanup. Restart clears registrations
+and credentials.
 
 All live registrations may discover and verify all others under the current open
 lab policy. Swarm membership, invitations, accounts, key rotation, administrative

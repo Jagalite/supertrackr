@@ -42,8 +42,8 @@ impl Model for Registration {
                     .checked_add(ttl)
                     .ok_or_else(|| ModelError::new("deadline overflow"))?,
             },
-            Operation::Check if s.active && i.now < s.expires => *s,
-            Operation::Refresh { ttl } if s.active && i.now < s.expires && ttl > 0 => Lease {
+            Operation::Check if valid(*s, i.now) => *s,
+            Operation::Refresh { ttl } if valid(*s, i.now) && ttl > 0 => Lease {
                 active: true,
                 expires: i
                     .now
@@ -62,20 +62,35 @@ impl Model for Registration {
         }])
     }
 }
+/// Shared eligibility predicate: expected expiry is not an allocating error path.
 pub fn valid(lease: Lease, now: u64) -> bool {
-    Registration
-        .step(
-            &lease,
-            &Input {
-                now,
-                op: Operation::Check,
-            },
-        )
-        .is_ok()
+    lease.active && now < lease.expires
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn eligibility_and_check_transition_agree_at_boundaries() {
+        for active in [false, true] {
+            for expires in [0, 1, 10, u64::MAX] {
+                for now in [0, 1, 9, 10, u64::MAX - 1, u64::MAX] {
+                    let lease = Lease { active, expires };
+                    assert_eq!(
+                        valid(lease, now),
+                        Registration
+                            .step(
+                                &lease,
+                                &Input {
+                                    now,
+                                    op: Operation::Check
+                                }
+                            )
+                            .is_ok()
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn expiry_refresh_and_overflow() {
         let initial = Registration.initial_state().unwrap();

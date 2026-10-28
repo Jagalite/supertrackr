@@ -124,7 +124,7 @@ async fn discovery_verification_and_authenticated_refresh() {
     .await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(result["token"], bt);
-    assert_eq!(state.len(), 2);
+    assert_eq!(state.len().await.unwrap(), 2);
     assert_eq!(
         call(
             &app,
@@ -319,7 +319,7 @@ async fn expiry_refresh_cannot_resurrect_and_old_tokens_fail() {
             .0,
         StatusCode::UNAUTHORIZED
     );
-    state.cleanup();
+    state.cleanup().await.unwrap();
     let (_, new_token) = reg(&app, 1).await;
     assert_ne!(at, new_token);
     assert_eq!(
@@ -375,7 +375,7 @@ async fn concurrent_registration_obeys_capacity() {
         }
     }
     assert_eq!(admitted, 32);
-    assert_eq!(state.len(), 32);
+    assert_eq!(state.len().await.unwrap(), 32);
 }
 
 #[tokio::test]
@@ -469,7 +469,7 @@ async fn concurrent_discovery_verification_refresh_and_cleanup() {
                             .0,
                             StatusCode::OK
                         );
-                        state.cleanup();
+                        state.cleanup().await.unwrap();
                     }
                     _ => {
                         assert_eq!(
@@ -492,5 +492,5 @@ async fn concurrent_discovery_verification_refresh_and_cleanup() {
     for task in tasks {
         task.await.unwrap();
     }
-    assert_eq!(state.len(), 64);
+    assert_eq!(state.len().await.unwrap(), 64);
 }

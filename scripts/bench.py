@@ -7,6 +7,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--rate', type=int, default=5000)
 p.add_argument('--seconds', type=int, default=10)
 p.add_argument('--population', type=int, default=10000)
+p.add_argument('--ttl-seconds', type=int, default=300)
 p.add_argument('--repeats', type=int, default=1)
 p.add_argument('--workers', type=int, choices=range(1, 257), default=32)
 p.add_argument('--load-threads', type=int, choices=range(1, 17), default=2)
@@ -15,7 +16,7 @@ p.add_argument('--diagnostic', action='store_true', help='Run server after faile
 p.add_argument('--modes', nargs='+', choices=['register','refresh','peers','verify'], default=['register','refresh','peers','verify'])
 a = p.parse_args()
 if not (1 <= a.rate <= 1000000 and 1 <= a.seconds <= 60 and a.repeats > 0
-        and a.workers * 2 <= a.population <= 50000):
+        and a.workers * 2 <= a.population <= 1000000 and 1 <= a.ttl_seconds <= 86400):
     p.error('invalid rate, duration, repetitions or population')
 if 'peers' in a.modes and not (1 <= a.peer_limit <= 100 and a.peer_limit < a.population):
     p.error('peer limit must be 1..100 and smaller than population')
@@ -27,7 +28,7 @@ server_capacity = max(1000000, a.population + a.rate * a.seconds)
 manifest = {str(f.relative_to(ROOT)): hashlib.sha256(f.read_bytes()).hexdigest() for f in [ROOT/'Cargo.toml',ROOT/'Cargo.lock',*sorted((ROOT/'src').rglob('*.rs'))]}
 metadata = {'platform': platform.platform(), 'machine': platform.machine(), 'settings':vars(a), 'tokio_threads_per_process':2, 'source_sha256':manifest,
             'binaries':{name:hashlib.sha256((ROOT/'target/release'/name).read_bytes()).hexdigest() for name in ['supertrackr','load','echo']},
-            'server_capacity':server_capacity, 'load_tokio_threads':a.load_threads,
+            'cost_diagnostics': 'SUPERTRACKR_COST_DIAGNOSTICS' in env, 'server_capacity':server_capacity, 'load_tokio_threads':a.load_threads,
             'driver_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             'scope':'native macOS loopback HTTP/1.1; no TLS, WireGuard handshake, NAT, relay, or Aquatic comparison'}
 (folder/'manifest.json').write_text(json.dumps(metadata,indent=2)+'\n')
@@ -52,8 +53,8 @@ def arm(kind, mode, repeat):
     with socket.socket() as s: s.bind(('127.0.0.1',0)); port=s.getsockname()[1]
     name=f'{repeat}-{kind}-{mode}'
     cmd=[str(ROOT/'target/release'/('echo' if kind=='calibration' else 'supertrackr')), '--listen',f'127.0.0.1:{port}']
-    if kind=='server': cmd+=['--lab-http','--open-registration','--capacity',str(server_capacity)]
-    with (folder/f'{name}.server.log').open('w') as log:
+    if kind=='server': cmd+=['--lab-http','--open-registration','--capacity',str(server_capacity),'--ttl-seconds',str(a.ttl_seconds)]
+    with (folder/f'{name}.server.log').open('w') as log, (folder/f'{name}.stdout').open('w') as output, (folder/f'{name}.stderr').open('w') as errors:
         proc=subprocess.Popen(cmd,stdout=log,stderr=log,env=env)
         child=None
         try:
@@ -64,7 +65,7 @@ def arm(kind, mode, repeat):
                 except OSError: time.sleep(.05)
             else: raise RuntimeError('server did not listen')
             load=[str(ROOT/'target/release/load'),'--url',f'http://127.0.0.1:{port}','--mode',mode,'--rate',str(a.rate),'--seconds',str(a.seconds),'--population',str(a.population),'--workers',str(a.workers),'--peer-limit',str(a.peer_limit)]
-            child=subprocess.Popen(load,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=load_env)
+            child=subprocess.Popen(load,stdout=output,stderr=errors,text=True,env=load_env)
             peak=0
             load_peak=0
             combined_peak=0
@@ -78,9 +79,9 @@ def arm(kind, mode, repeat):
                 combined_peak=max(combined_peak,server_rss+load_rss)
                 samples.append({'seconds':round(time.monotonic()-sample_start,3),'server_rss_kib':server_rss,'load_rss_kib':load_rss,'combined_rss_kib':server_rss+load_rss})
                 time.sleep(.25)
-            out,err=child.communicate()
+            child.wait()
+            out=(folder/f'{name}.stdout').read_text()
             (folder/f'{name}.ram.json').write_text(json.dumps(samples,indent=2)+'\n')
-            (folder/f'{name}.stdout').write_text(out); (folder/f'{name}.stderr').write_text(err)
             result=json.loads(out.strip().splitlines()[-1]) if out.strip() else {'passed':False,'error':'no result'}
             result.update(kind=kind,repeat=repeat,exit_code=child.returncode,server_peak_sampled_rss_kib=peak,load_peak_sampled_rss_kib=load_peak,combined_peak_sampled_rss_kib=combined_peak,command=load)
             (folder/f'{name}.json').write_text(json.dumps(result,indent=2)+'\n')

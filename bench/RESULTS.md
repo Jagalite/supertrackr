@@ -169,3 +169,161 @@ Validation: nine executed Rust model/API tests passed, including concurrent disc
 - server peers: 100/100 completed, 0 late, 0 errors.
 - calibration verify: 100/100 completed, 0 late, 0 errors.
 - server verify: 100/100 completed, 0 late, 0 errors.
+
+
+## Single-owner registry refactor — 2026-10-28
+
+Checkpoint before refactor: `05c963d`. The candidate replaces shared registry
+shards with a synchronous `Registry` owned by one Tokio command task. Registry
+storage, capacity, discovery cursor, refresh, verification, and cleanup have no
+locks or atomics. The unbounded command channel still provides synchronization
+outside the core; it is separate from the generator queues.
+
+Validation: 13 executed Rust tests passed (7 unit, 6 API), including concurrent
+API operations and owner cancellation/shutdown behavior. All-target Clippy with
+`-D warnings`, release binaries, formatting, and diff checks passed.
+
+Native HTTP diagnostic: `bench/results/20261028-160227`, 100 scheduled requests
+per second for one second per arm, population 100, peer limit 10, one repeat.
+Register, peers, and verify each completed 100/100 server requests. Refresh
+completed 99/100, with one generator-late offer. Every accepted server request
+returned a validated response; no request errors or queue drops occurred. Peer
+calibration completed 98/100 with two late offers, so refresh and peers failed
+the full accounting/calibration gate. This is functional diagnostic evidence,
+not throughput qualification or a performance comparison with the checkpoint.
+Server peak sampled RSS ranged from 4,704 to 5,872 KiB across these small arms;
+this is not a large-population memory result. Source and release-binary hashes
+were checked against the run manifest.
+
+
+## Single-owner performance diagnostic — 2026-10-28
+
+Native macOS loopback HTTP/1.1, five seconds per arm, one repeat, 10,000 initial peers, discovery limit 20, 32 connections, two Tokio threads per process. Generator queues remain unbounded. Every operation ran against echo calibration and a fresh server. No TLS or WireGuard traffic.
+
+| Target/s | Operation | Completed/offered | Late offers | Elapsed ms | Drain ms | E2E p99 ms | Server peak MiB | Calibration + accounting |
+|---:|---|---:|---:|---:|---:|---:|---:|---|
+| 100,000 | register | 500,000/500,000 | 0 | 5,002 | 2 | 28.464 | 226.0 | fail |
+| 100,000 | refresh | 500,000/500,000 | 0 | 5,003 | 3 | 5.823 | 9.9 | pass |
+| 100,000 | peers | 500,000/500,000 | 0 | 6,316 | 1,316 | 1305.467 | 10.0 | fail |
+| 100,000 | verify | 497,261/500,000 | 2,739 | 5,002 | 2 | 32.435 | 10.0 | fail |
+| 25,000 | register | 124,411/125,000 | 589 | 5,000 | 0 | 3.152 | 59.7 | fail |
+| 25,000 | refresh | 125,000/125,000 | 0 | 5,000 | 0 | 0.436 | 9.8 | pass |
+| 25,000 | peers | 124,692/125,000 | 308 | 5,000 | 0 | 28.654 | 10.0 | fail |
+| 25,000 | verify | 125,000/125,000 | 0 | 5,000 | 0 | 0.424 | 9.8 | pass |
+
+All accepted requests returned validated responses, with zero errors, queue drops, or closed channels. At 100k/s, registration calibration missed 2,717 offers; discovery calibration missed 2,526 and drained for 2,586 ms. Verification server missed 2,739 offers. All 25k/s calibrations passed, but registration and discovery server arms missed 589 and 308 offers respectively. These misses are generator offers over 10 ms late, not server response errors.
+
+Refresh passed the five-second 100k/s point; refresh and verification passed the 25k/s point. This is a single-run result, not sustained production capacity. Discovery at 100k/s accumulated a 1,316 ms drain and cannot be called sustained 100k/s even though its server completed every offer. No speedup claim versus the checkpoint is supported because it was not rerun. RSS is sampled every approximately 250 ms over setup and measurement, not precise heap usage. Registration grows the registry while other arms retain their initial population; their RSS values are not equal-population comparisons.
+
+Receipt: [results/20261028-160957/summary.json](results/20261028-160957/summary.json).
+Receipt: [results/20261028-161049/summary.json](results/20261028-161049/summary.json).
+Source and binary hashes matched both manifests.
+
+
+## One million resident peers — 2026-10-28
+
+[Receipts](results/20261028-162256/summary.json). Native macOS loopback HTTP/1.1; one million distinct registrations on each fresh server, 25,000 scheduled requests/s for ten seconds per operation, one repeat, 32 connections, two Tokio threads per process. Discovery returns 20 peers. Each operation has its own matching echo calibration. Server capacity 1,250,000; lease TTL 3,600 seconds so the entire population stays live through setup and measurement.
+
+| Operation | Setup seconds | Completed/offered | E2E p50 ms | E2E p99 ms | Server peak MiB | Combined peak MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| refresh | 51.634 | 250,000/250,000 | 0.287 | 32.231 | 461.9 | 761.8 |
+| peers | 51.528 | 250,000/250,000 | 0.335 | 43.624 | 462.0 | 767.9 |
+| verify | 51.506 | 250,000/250,000 | 0.318 | 33.985 | 461.9 | 761.7 |
+
+All three calibration and server pairs passed request accounting, with zero late offers, errors, queue drops or closed channels. Server arms each finished in 10,001 ms, including 1 ms drain. This demonstrates the tested million-record workload at 25k/s; it does not establish maximum capacity, mixed-workload performance, or a million simultaneous connections. The timed workload exercises 250,000 distinct callers within the resident population.
+
+Peak RSS was sampled approximately every 250 ms across setup and measurement; combined means simultaneous server plus generator RSS. It is not precise heap usage. Median latency remains below 0.4 ms, but p99 is 32–44 ms. The owner performs whole-registry cleanup every five seconds; its contribution to tail latency requires profiling and is not established by these receipts. Two host health snapshots reported normal memory pressure; these are spot checks, not continuous pressure monitoring.
+
+Harness changes: allow up to one million HTTP identities while retaining Aquatic's 50,000 limit; preallocate the identity vector; record setup duration; expose server TTL in the driver. No server implementation change was made for this test. Kyoto release build succeeded; both Python driver tests, formatting and diff checks passed. Source, driver and binary hashes match the manifest.
+
+
+## Core cost measurements and HTTP correlation — 2026-10-28
+
+Direct production `Registry` methods were measured with the pinned `statelessness-debug` monotonic clock and bounded duration histograms. A counted System allocator records allocation/reallocation calls and requested bytes. Three fresh-registry repetitions at each population. Reporting, histogram insertion, and percentile sorting are outside timed operations. Instrumentation affects absolute timings; nanosecond-scale results include timer overhead (median control 41 ns). This is a diagnostic, not capacity or CPU-profile attribution.
+
+[Core raw receipts](results/core-costs-20261028-164158/results.jsonl), [manifest](results/core-costs-20261028-164158/manifest.json), and [process resource report](results/core-costs-20261028-164158/stderr.txt).
+
+| Operation | 10k peers | 100k peers | 1M peers |
+|---|---:|---:|---:|
+| cleanup_live | 229.250 µs | 3,676.750 µs | 69,149.459 µs |
+| cleanup_expired | 564.958 µs | 7,036.583 µs | 57,684.083 µs |
+| discovery_20 | 1.167 µs | 2.292 µs | 4.250 µs |
+| discovery_100 | 5.417 µs | 11.833 µs | 18.542 µs |
+| discovery_expired_4096 | 245.333 µs | 624.125 µs | 768.041 µs |
+| refresh | 0.125 µs | 0.208 µs | 0.292 µs |
+| verify | 0.125 µs | 0.125 µs | 0.125 µs |
+
+Table values are medians of the three run medians. Live cleanup has ten samples per run; mass expiry has one destructive sample per fresh population. Request methods use 10,000 samples; expired discovery uses 100. Direct method latencies exclude HTTP, command-channel waiting, and encoding. Key generation and result destruction are included in some request measurements; this is not a cycle-level isolated model benchmark.
+
+**Findings:**
+
+- Live million-peer cleanup run medians were 67.774, 70.369, and 69.149 ms. Across all 30 sweeps the range was 65.602–126.256 ms, with zero allocations. These synchronous scans block the sole owner.
+- The largest registration growth event occurred at insertion 917,505: 21.940–36.581 ms across three repetitions, requesting a 236,978,184-byte allocation. Registration performed 39 allocation/reallocation calls while building each million-record registry; cumulative requested bytes were 541,064,796, not retained memory.
+- Expiring 999,999 peers left one refreshed peer and made 999,999 temporary error-string allocations (23,999,976 requested bytes). Direct expired-lease checks also measured one allocation each.
+- Discovery of 20 or 100 live peers made one result-vector allocation per request. At one million records, exhausting the 4,096-candidate scan against expired peers made 4,097 allocations per request and had run medians 747–771 µs. The result was empty, as expected.
+- Refresh and verification made zero allocations in the core. Sparse cleanup after expiry was much cheaper (run medians 7.916–42.125 µs), so table capacity alone did not imply a full populated-table pause.
+
+**HTTP correlation:** [receipt](results/20261028-164216/summary.json), [cleanup spans](results/20261028-164216/0-server-verify.server.log), [bounded slow-response correlation](results/20261028-164216/correlation.json). One million resident peers, verification offered at 25k/s for 15 seconds, 32 connections, 3,600-second leases. Both calibration and server completed 374,993/375,000 with seven late offers each and zero response errors. The accounting/calibration gate failed, so no capacity claim follows. Server p99 was 32.697 ms. Three full-population cleanup spans lasted 72.788, 69.689, and 73.130 ms.
+
+Nine of the 32 captured first-slow responses had send-to-completion intervals overlapping a 72.788 ms cleanup; their end-to-end latency was about 72 ms. The other 23 were earlier approximately 10 ms delays dominated by generator waiting, illustrating that not every tail event is server cleanup. Sampling retains only the first >10 ms successful response per worker, and wall-clock alignment is approximate. The measured synchronous stalls plus request overlap establish cleanup as a real latency concern; they do not attribute every p99 event or prove a speedup from an unimplemented replacement.
+
+Priority: avoid unconditional whole-population cleanup work and bound maintenance pauses; then address growth spikes and allocation-producing expiry checks. No optimization was implemented in this measurement pass. The only server change is opt-in cleanup timestamps, disabled unless `SUPERTRACKR_COST_DIAGNOSTICS` is present. Statelessness debug is a dev dependency used by the standalone example, not a normal-server runtime dependency.
+
+Validation: Kyoto release builds and all-target Clippy with warnings denied passed. All 13 Rust tests executed with diagnostics enabled passed; both Python driver tests passed. Source/binary/driver hashes matched the recorded manifests.
+
+The separate `scripts/check_load.py` check did not complete: on both attempts its
+first valid-response arm admitted 9/10 requests, with one late offer and zero
+response errors. Its strict completeness assertion stopped execution before the
+remaining cases. This is recorded as a failed validation run, not a passing
+response-validation suite.
+
+
+## Basic fixes for measured stalls — 2026-10-28
+
+Implemented four limited changes: shared allocation-free lease eligibility; map and discovery-vector reservation for configured capacity at initialization; skipping full index compaction when explicit cleanup removes nothing; and periodic maintenance in batches of at most 4,096 candidates every 20 ms. Expired entries use swap removal from the index. No locks, sharding, new expiry queue, or new storage representation were introduced. Authorization still checks expiry at processing time, independently of physical reclamation. Reclamation duration depends on population and load. The explicit full-cleanup method retains its complete-reclamation semantics and can still block for a full scan.
+
+Reservation trades upfront allocation/reserved memory for avoiding initial-fill growth reallocations. It does not establish absence of rehash costs under sustained churn.
+
+[Core receipts](results/core-fixes-20261028-165215/results.jsonl), [manifest](results/core-fixes-20261028-165215/manifest.json). Same instrumented direct-core harness, now also measuring initialization and maintenance batches. Three fresh-registry repetitions. At one million peers:
+
+| Operation | Median of run medians | Allocations per operation |
+|---|---:|---:|
+| initialize | 36.792 µs | 2 |
+| register | 0.125 µs | 0 |
+| cleanup_live | 4,469.750 µs | 0 |
+| cleanup_batch_live | 292.042 µs | 0 |
+| cleanup_batch_expired | 608.458 µs | 0 |
+| cleanup_expired | 26,848.917 µs | 0 |
+| discovery_expired_4096 | 405.208 µs | 1 |
+
+Initialization made two allocations; all one million subsequent registration inserts made zero allocations/reallocations. The largest measured insert was 52.041 µs, versus 21.940–36.581 ms growth events in the previous diagnostic. Initialization requested memory up front; allocation cost and storage were moved, not eliminated.
+
+Live 4,096-entry batch run medians were 290–368 µs; expired-entry batch medians were 607–621 µs. Largest expired batch was 1.159 ms. Mass full cleanup of 999,999 expired records now made zero allocations; expired discovery retained only its single result-vector allocation. The standalone explicit full-cleanup live scan still takes roughly 4.5 ms, and full mass expiry roughly 27 ms; these are not used by periodic maintenance. Batch timing measures a smaller work unit than the prior full sweep and must not be interpreted as an equal-work throughput speedup. Batching bounds uninterrupted work, and can increase total reclamation work by doing individual lookups/removals.
+
+**HTTP diagnostic:** [receipt](results/20261028-165255/summary.json). One million peers, verification at 25k scheduled requests/s for 15 seconds, diagnostics enabled, matching echo calibration. Calibration completed 374,923/375,000 with 77 late offers; server completed 374,860/375,000 with 140 late offers. Both had zero response errors, zero queue drops and 1 ms drain. The full accounting/calibration gate failed. Observed server p99 was 0.730 ms (previous diagnostic 32.697 ms); this is diagnostic latency evidence, not a qualified capacity or throughput ratio.
+
+At full population, 727 logged maintenance batches had a median of 512 µs, p99 of 699 µs, and maximum of 5,098 µs. Server peak sampled RSS was 269,280 KiB (263.0 MiB), and combined server/generator peak was 581,568 KiB (567.9 MiB); sampling spans setup and measurement. Source, driver and binary hashes match the manifests.
+
+Validation: 15 executed Rust tests passed with diagnostics enabled, including mixed expiry/refresh during batched cleanup, bounded removal, discovery coverage after swaps, capacity reuse, and lease-boundary agreement. Kyoto release build, all-target Clippy with warnings denied, formatting, diff checks and both Python driver tests passed. `scripts/check_load.py` again stopped on 9/10 admitted requests with one late offer and zero errors, so its remaining response-validation cases were not executed. No changes were committed in this pass.
+
+## Final review fixes and validation — 2026-10-28
+
+Reviewed the complete single-owner refactor and bounded cleanup change before
+commit. Fixed benchmark process output handling: generator stdout/stderr now go
+directly to receipt files, avoiding a deadlock when diagnostics exceed pipe
+capacity. A regression test emits 256 KiB to each stream and completes both arms.
+Diagnostic logging now tolerates a failed stderr write and an unavailable wall
+clock; a live release-server check closed its stderr reader and confirmed that
+registrations continued after periodic cleanup ticks.
+
+The response-validator check now tests every admitted response and explicitly
+reports late offers. It requires nonzero admission, exact accounting, and correct
+success/error/exit status; it does not relax the load binary's `passed` criterion
+or the benchmark calibration gate. Both valid-response and wrong-peer-key cases
+executed successfully after this correction.
+
+Final validation: 15 executed Rust tests with diagnostics enabled, three Python
+driver tests, both response-validator cases, all-target Clippy with warnings
+denied, release binaries, formatting and diff checks passed. These review fixes
+were not subjected to a new high-rate capacity run. Earlier benchmark receipts
+remain historical evidence tied to their recorded source and binary hashes.

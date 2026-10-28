@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf};
 use supertrackr::{Config, Coordinator, router};
 #[derive(Parser)]
 struct Args {
@@ -45,14 +45,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         capacity: a.capacity,
         ttl_seconds: a.ttl_seconds,
         open_registration: a.open_registration,
-    });
-    let cleaner = state.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            tick.tick().await;
-            cleaner.cleanup();
-        }
     });
     eprintln!(
         "Listening on {}; RAM-only prototype; open_registration={}",

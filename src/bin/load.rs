@@ -39,6 +39,7 @@ struct Stats {
     service_lat: Vec<u64>,
     queue_lat: Vec<u64>,
     response_bytes: usize,
+    slow_samples: Vec<Value>,
 }
 #[derive(serde::Deserialize)]
 struct PeerResponse {
@@ -123,7 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || a.seconds > 60
         || a.workers == 0
         || a.workers > 256
-        || a.population > 50000
+        || a.population > 1_000_000
+        || (a.mode == "aquatic" && a.population > 50_000)
         || a.population < a.workers * 2
         || (a.mode == "peers"
             && (a.peer_limit == 0 || a.peer_limit > 100 || a.peer_limit >= a.population))
@@ -141,7 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let c = client(a.ca.as_deref())?;
     let seed = rand::random::<u64>();
-    let mut identities = Vec::new();
+    let mut identities = Vec::with_capacity(a.population);
+    let setup_start = Instant::now();
     // Setup and the expected discovery-key set are outside the measured interval.
     for i in 0..a.population {
         let k = key(seed, i);
@@ -160,9 +163,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         identities.push((k, t));
     }
+    let setup_ms = setup_start.elapsed().as_millis();
+    eprintln!("Registered {} peers in {} ms", identities.len(), setup_ms);
     let known_keys: Arc<std::collections::HashSet<String>> =
         Arc::new(identities.iter().map(|(k, _)| k.clone()).collect());
     let identities = Arc::new(identities);
+    let diagnostics = std::env::var_os("SUPERTRACKR_COST_DIAGNOSTICS").is_some();
+    let wall_anchor_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_micros();
+    let monotonic_anchor = Instant::now();
     let mut senders = Vec::new();
     let mut handles = Vec::new();
     for worker in 0..a.workers {
@@ -278,6 +288,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => false,
                         };
                         if good {
+                            if diagnostics && s.slow_samples.is_empty() && planned.elapsed() > Duration::from_millis(10) {
+                                s.slow_samples.push(json!({
+                                    "worker":worker,
+                                    "planned_wall_us":wall_anchor_us + planned.duration_since(monotonic_anchor).as_micros(),
+                                    "sent_wall_us":wall_anchor_us + sent.duration_since(monotonic_anchor).as_micros(),
+                                    "completed_wall_us":wall_anchor_us + monotonic_anchor.elapsed().as_micros()
+                                }));
+                            }
                             s.success += 1;
                             s.service_lat.push(sent.elapsed().as_micros() as u64);
                             s.lat.push(planned.elapsed().as_micros() as u64);
@@ -328,6 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all = Stats::default();
     for h in handles {
         let s = h.await?;
+        all.slow_samples.extend(s.slow_samples);
         all.success += s.success;
         all.errors += s.errors;
         all.lat.extend(s.lat);
@@ -351,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let passed = accepted == total && all.success == total && all.errors == 0;
     println!(
         "{}",
-        json!({"pacing":"dedicated-thread-250us","mode":a.mode,"peer_limit":a.peer_limit,"response_bytes":all.response_bytes,"service_p99_us":all.service_lat.get(all.service_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"target_rps":a.rate,"duration_seconds":a.seconds,"population":a.population,"workers":a.workers,"queue_mode":"unbounded","queue_per_worker":null,"queue_wait_p99_us":all.queue_lat.get(all.queue_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"queue_wait_max_us":all.queue_lat.last().copied().unwrap_or(0),"offered":total,"accepted":accepted,"late":late,"queue_dropped":0,"channel_closed":closed,"success":all.success,"errors":all.errors,"statuses":all.statuses,"e2e_p50_us":percentile(50),"e2e_p95_us":percentile(95),"e2e_p99_us":percentile(99),"offer_ms":offer_ms,"elapsed_ms":elapsed.as_millis(),"drain_ms":elapsed.as_millis().saturating_sub(offer_ms),"passed":passed,"latency_scope":"successful requests, from scheduled offer through complete validated response","transport":if endpoint.scheme() == "http" {"http HTTP/1.1 worker-owned hyper"} else {"https HTTP/1.1 reqwest"}})
+        json!({"slow_samples":all.slow_samples,"diagnostics":diagnostics,"pacing":"dedicated-thread-250us","mode":a.mode,"peer_limit":a.peer_limit,"response_bytes":all.response_bytes,"service_p99_us":all.service_lat.get(all.service_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"target_rps":a.rate,"duration_seconds":a.seconds,"population":a.population,"setup_ms":setup_ms,"workers":a.workers,"queue_mode":"unbounded","queue_per_worker":null,"queue_wait_p99_us":all.queue_lat.get(all.queue_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"queue_wait_max_us":all.queue_lat.last().copied().unwrap_or(0),"offered":total,"accepted":accepted,"late":late,"queue_dropped":0,"channel_closed":closed,"success":all.success,"errors":all.errors,"statuses":all.statuses,"e2e_p50_us":percentile(50),"e2e_p95_us":percentile(95),"e2e_p99_us":percentile(99),"offer_ms":offer_ms,"elapsed_ms":elapsed.as_millis(),"drain_ms":elapsed.as_millis().saturating_sub(offer_ms),"passed":passed,"latency_scope":"successful requests, from scheduled offer through complete validated response","transport":if endpoint.scheme() == "http" {"http HTTP/1.1 worker-owned hyper"} else {"https HTTP/1.1 reqwest"}})
     );
     if !passed {
         std::process::exit(2);

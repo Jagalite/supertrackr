@@ -55,30 +55,42 @@ The WireGuard handshake will authenticate key possession on clients.
 
 Registrations expire after 300 seconds by default (`--ttl-seconds`, 1–86400).
 Authenticated refresh before expiry extends the lease and can change the endpoint;
-expired tokens cannot refresh or resurrect records. Cleanup runs every five seconds,
-so expired entries can temporarily occupy capacity or return a registration conflict.
+expired tokens cannot refresh or resurrect records. Periodic cleanup checks at most
+4,096 entries every 20 ms; total reclamation time grows with population and load.
+Expired entries can temporarily occupy capacity or return a registration conflict.
 Restart clears everything. Key rotation and administrative revocation are deferred.
 
-The server has 64 maps protected by read/write locks, a capacity limit of 100,000 records
-by default, ordered pair locking, and a 2 KiB request-body limit. Discovery rotates
-its starting shard and its position within each shard, examines at most 4,096
-records, and returns a bounded sample. A compact key index adds 32 bytes per
-registration before vector spare capacity; stable registrations are not permanently
-excluded by a fixed iteration prefix.
-It may return fewer than requested and is neither full pagination nor uniform
-random selection. Discovery checks multiple peers under each ordered pair of shared shard locks,
-without relocking per returned peer. Verification also uses shared locks; registration,
-refresh and cleanup use exclusive locks. Sampling cursors are atomic. Token parsing,
-new-token generation/hashing and response encoding occur outside the write locks.
-Each peer is checked with the caller; the list is not an atomic snapshot. Endpoint changes and expiry can make a response stale.
+The synchronous `core::Registry` owns all records, a compact discovery key index,
+and separate discovery and cleanup cursors. It has no locks, atomics, channels, clocks or I/O. One
+Tokio owner task processes commands sequentially and runs periodic expiry cleanup.
+HTTP handlers parse requests, generate/hash new session tokens, submit commands,
+and encode responses. The owner supplies processing-time timestamps; queued work
+cannot renew or verify a registration using an old enqueue timestamp.
+
+Storage is reserved up front for the configured capacity, trading startup allocation
+and reserved memory for avoiding growth reallocations during the initial fill.
+The default registration capacity is 100,000, request bodies are limited to 2 KiB,
+and discovery examines at most 4,096 records per command. The key index adds 32
+bytes per registration before vector spare capacity. Discovery is a bounded,
+rotating sample rather than complete pagination or uniform random selection.
+Each operation observes a consistent registry state at its processing timestamp;
+responses can still become stale after execution.
+
+The coordinator's command channel is unbounded and separate from the benchmark
+worker queues. Channel internals provide synchronization, but nothing shares or
+locks the registry. All operations and cleanup serialize on the owner task, so
+throughput and cleanup pauses need measurement. Dropping all handles closes the
+owner after queued commands have been handled. Cancellation observed before
+execution skips a command; once an operation starts, it may commit even if its
+HTTP client disconnects. An unavailable owner returns HTTP 503.
 
 There are no pending brokering requests, per-peer inboxes, or poll endpoints.
 The old `/v1/peers/{key}`, `/v1/connect/{key}`, `/v1/pending`, and `/v1/self` routes
-are removed. Statelessness models the lease lifecycle and deterministic access decisions
-(caller eligibility, target expiry, self-query rejection and endpoint matching).
-The host supplies credential comparisons and synchronized facts; the core performs
-no I/O, crypto or locking. Complete concurrent
-host verification and large-population cleanup costs remain unqualified.
+are removed. Statelessness models the lease lifecycle and deterministic access
+decisions (caller eligibility, target expiry, self-query rejection and endpoint
+matching). The registry supplies authentication facts; these models perform no
+I/O, crypto or locking. The registry itself performs constant-time token-hash
+comparisons. Complete runtime verification and capacity qualification remain open.
 
 This server does not implement the direct peer-introduction protocol, configure
 WireGuard, assign tunnel addresses, perform NAT traversal/relaying, or close an
@@ -112,10 +124,14 @@ are counted as late and not sent. Both service and scheduled-to-completion
 latency are reported for successful requests. Failed calibration prevents the
 corresponding server run. Server failures remain in the receipt. Interrupting the
 driver with SIGINT or SIGTERM stops and reaps both server and generator. Invalid
-settings are rejected before either process is launched.
+settings are rejected before either process is launched. Generator stdout/stderr
+are written directly to receipt files so verbose diagnostics cannot fill a pipe
+and block process completion.
 
 Run `python3 scripts/check_load.py` after rebuilding the release load binary to
 check valid HTTP responses and rejection of a response containing the wrong peer key.
+This functional check reports late offers and validates every admitted response;
+it does not qualify throughput or relax the benchmark's completeness gate.
 
 Benchmark modes are `register`, `refresh`, `peers`, and `verify`. Creation and
 refresh use the same API but are measured separately. Discovery requests 20 peers
@@ -137,3 +153,25 @@ history remain under the ignored `untracked/` archive.
 `--diagnostic` runs server arms even after failed calibration; receipts retain the calibration result. `passed` and `accounting_passed` check completeness only. Always inspect total elapsed time and drain time before interpreting the offered rate as throughput.
 
 Benchmark driver regression tests: `python3 tests/bench_driver_test.py`. These use temporary fake processes to test interruption cleanup and argument validation.
+
+Core cost diagnostics use the pinned `statelessness-debug` monotonic clock and
+bounded metric histograms, with a counted allocator in a standalone example:
+
+```sh
+python3 /path/to/kyoto/kyoto.py submit -- cargo build --release --example core_costs
+# After the build succeeds:
+target/release/examples/core_costs > core-costs.jsonl
+```
+
+The example measures the production registry at 10k, 100k, and one million peers,
+with three repetitions. Timers and allocation counters affect absolute timings;
+reporting and histogram updates are outside the timed regions. Allocated-byte
+counts are cumulative requested bytes, not live heap usage. This is separate from
+HTTP throughput qualification.
+
+For HTTP correlation, set `SUPERTRACKR_COST_DIAGNOSTICS=1` when running
+`scripts/bench.py`. The server logs each periodic cleanup batch's wall-clock start and
+monotonic duration. The generator retains the first successful response exceeding
+10 ms per worker, with approximate wall-clock timestamps for its scheduled offer,
+send, and completion. Samples are deliberately bounded and are not a complete
+latency trace. Diagnostics are off unless the environment variable is present.
