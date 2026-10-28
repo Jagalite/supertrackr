@@ -52,8 +52,8 @@ cryptographic proofs or persistent grants.
 A obtains B's public key and endpoint through discovery. When B receives A's
 introduction, it can verify A's claimed binding if it has not already obtained
 trusted metadata. WireGuard subsequently proves possession of each configured
-private key. The direct introduction listener/protocol and client implementation
-are not part of this server prototype. NAT traversal may require further coordination.
+private key. The direct introduction listener/protocol remains deferred. The first client lab
+uses discovery on both sides instead. NAT traversal may require further coordination.
 
 There are no pending introductions, connection-request queues, poll endpoints, or
 server-side pair graphs. The old lookup, connect, pending and self-removal routes
@@ -102,9 +102,21 @@ lab policy. Swarm membership, invitations, accounts, key rotation, administrativ
 revocation, tunnel-address allocation and allowed-IP policy remain deferred.
 Expiry at the server does not automatically close an existing client tunnel.
 
-No WireGuard handshake, reachability, NAT traversal, relay, or data-transfer proof
-is claimed. QUIC/DTLS profiles, persistence, replication and BitTorrent application
-integration are deferred. The previous repository remains under `untracked/`.
+The `client` binary is a single-peer loopback prototype using BoringTun 0.7.1. It
+registers a persisted WireGuard public key and its actual UDP socket, renews its
+session, discovers a peer, and verifies the exact key/endpoint before configuring
+a tunnel. It pins the first verified key (or an explicit `--peer-key`) for that run.
+Local and peer lease deadlines are checked before processing traffic; failed
+control requests terminate the client. Only verified loopback endpoints and the
+configured inner IPv4 source/destination are accepted. Private keys are owner-only
+files; session tokens remain in RAM.
+
+The client exchanges real WireGuard handshake/data packets carrying a small IPv4/UDP
+ping/pong payload. It does not install an OS TUN device, change routes, or provide a
+general socket/IP forwarding API. Local two-process traffic is tested; NAT traversal,
+relays, reconnect recovery, general multi-peer routing, non-loopback reachability,
+QUIC/DTLS profiles, persistence/replication of server state, and BitTorrent application
+integration remain deferred. The previous repository remains under `untracked/`.
 
 Historical benchmark receipts describe earlier APIs. They cannot establish the
 performance of this three-operation design. The generator retains unlimited

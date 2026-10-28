@@ -175,3 +175,50 @@ monotonic duration. The generator retains the first successful response exceedin
 10 ms per worker, with approximate wall-clock timestamps for its scheduled offer,
 send, and completion. Samples are deliberately bounded and are not a complete
 latency trace. Diagnostics are off unless the environment variable is present.
+
+
+## Local WireGuard client prototype
+
+`client` uses [BoringTun](https://github.com/cloudflare/boringtun), pinned to 0.7.1,
+for WireGuard handshakes and encrypted transport. It sends small IPv4/UDP ping/pong
+packets in-process over loopback UDP. It requires no root privileges and creates
+no OS tunnel interface or routes. This is a single-peer client lab, not general IP
+forwarding or BitTorrent integration.
+
+Build through Kyoto, then run the two-process integration check:
+
+```sh
+python3 /path/to/kyoto/kyoto.py submit -- cargo build --release --bins
+# After the build succeeds:
+python3 scripts/check_client.py
+```
+
+The check starts a local server and two clients with three-second registration
+leases, verifies bidirectional encrypted traffic and repeated refresh, injects an
+unknown-source datagram, and saves receipts under `bench/results/client-*`. Private
+keys live in a temporary directory and are deleted after the check.
+
+For a manual lab, start `target/release/supertrackr --lab-http --open-registration` and run these
+commands in separate terminals (key-file parents must already exist):
+
+```sh
+target/release/client --server http://127.0.0.1:8443 --lab-http \
+  --key-file /tmp/supertrackr-a.wgkey --tunnel-ip 10.77.0.1 --peer-ip 10.77.0.2
+target/release/client --server http://127.0.0.1:8443 --lab-http \
+  --key-file /tmp/supertrackr-b.wgkey --tunnel-ip 10.77.0.2 --peer-ip 10.77.0.1
+```
+
+Each client binds an ephemeral loopback UDP port, registers, discovers and verifies
+a peer, and pins that peer's key for the run. Use `--peer-key <hex-public-key>` to
+require a specific peer. `--run-seconds` defaults to 30. Successful completion
+requires at least one authenticated round trip. JSON stdout contains public
+metadata and counters, never private keys or session tokens.
+
+Private keys are created with mode 0600 and reused; unsafe permissions and final
+symlinks are rejected. Store manual keys in a private directory outside the repo.
+Session tokens are RAM-only: after a client restart, its previous registration
+must expire before the same key can create a new session. Control failures stop
+the client; automatic reconnect is deferred. HTTP requires explicit loopback-only
+`--lab-http`; HTTPS uses normal certificate validation but has not been exercised
+by this lab. Open registration still permits key squatting and does not itself
+prove possession of a private key; the WireGuard handshake provides that proof.

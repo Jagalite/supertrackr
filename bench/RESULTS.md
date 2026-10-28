@@ -327,3 +327,32 @@ driver tests, both response-validator cases, all-target Clippy with warnings
 denied, release binaries, formatting and diff checks passed. These review fixes
 were not subjected to a new high-rate capacity run. Earlier benchmark receipts
 remain historical evidence tied to their recorded source and binary hashes.
+
+
+## First client milestone — 2026-10-28
+
+[Two-process receipt](results/client-20261028-171808/summary.json), with matching
+Rust source/dependency and binary hashes in its manifest. Two independent release
+`client` processes registered distinct persisted WireGuard keys through a local
+HTTP server, discovered and verified each other's exact public key/UDP endpoint,
+and exchanged real BoringTun WireGuard handshake/data traffic over loopback UDP.
+Each client completed eight IPv4/UDP ping/pong round trips in eight seconds and
+five successful registration refreshes with a three-second server lease. Both
+rejected an injected unknown-source datagram. Test private keys were created as
+mode 0600 files in an isolated temporary directory and removed after completion;
+receipts contain only public keys, endpoints and counters.
+
+All 20 executed Rust tests passed (15 existing server/core/API tests and five
+client tests). Client tests cover persisted-key consistency and unsafe key-file
+rejection; explicit loopback HTTP opt-in; inner-packet address/length/checksum
+checks; wrong-private-key handshake rejection; successful encrypted delivery;
+ciphertext tampering and replay rejection. Release builds, all-target Clippy with
+warnings denied, formatting and diff checks passed.
+
+This proves the local client handshake and in-process data path, not an OS TUN
+interface, general IP forwarding, standard-client interoperability, NAT traversal,
+relay behavior, remote-network reachability, HTTPS control transport, or client
+performance. The lab configures one peer and manually supplied inner IPv4
+addresses; session tokens are RAM-only, reconnect is deferred, and open
+registration still permits public-key squatting. No server protocol or registry
+implementation change was needed.

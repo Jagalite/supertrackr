@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.90"
 
 [dependencies]
+boringtun = { version = "=0.7.1", default-features = false }
+libc = "0.2"
+zeroize = "1"
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 clap = { version = "4", features = ["derive"] }
@@ -29,4 +32,5 @@ lto = "thin"
 codegen-units = 1
 
 [dev-dependencies]
+tempfile = "3"
 statelessness-debug = { git = "https://github.com/Jagalite/statelessness", rev = "0876717bee85e335449c2c99ada41f6c6e6112d1" }
