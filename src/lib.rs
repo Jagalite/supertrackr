@@ -1,9 +1,12 @@
+pub mod async_userspace;
 mod coordinator;
 pub mod core;
+pub mod enrollment;
 pub mod model;
 mod path_selection;
 pub mod peer_manager;
 pub mod stun;
+pub mod userspace;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, State},
@@ -21,6 +24,8 @@ type Result<T> = std::result::Result<T, StatusCode>;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisterRequest {
+    #[serde(default)]
+    pub proof: Option<enrollment::Proof>,
     pub public_key: String,
     pub endpoint: SocketAddr,
 }
@@ -108,14 +113,41 @@ async fn register(
             OsRng.fill_bytes(&mut raw);
             (None, hex::encode(raw), Sha256::digest(raw).into())
         };
-    let expires_in_seconds = s
-        .register_or_refresh(key, q.endpoint, credentials, token_hash)
+    let expires_in_seconds = if let Some(credentials) = credentials {
+        s.register_or_refresh(key, q.endpoint, Some(credentials), token_hash)
+            .await
+            .map_err(status)?
+    } else {
+        let proof = q.proof.ok_or(StatusCode::UNAUTHORIZED)?;
+        let id = parse_key(&proof.id)?;
+        let response = parse_key(&proof.response)?;
+        s.finish_enrollment(
+            key,
+            q.endpoint,
+            id,
+            Sha256::digest(response).into(),
+            token_hash,
+        )
         .await
-        .map_err(status)?;
+        .map_err(status)?
+    };
     Ok(Json(RegistrationResponse {
         token,
         expires_in_seconds,
     }))
+}
+async fn challenge(
+    State(s): State<Arc<Coordinator>>,
+    Json(q): Json<enrollment::ChallengeRequest>,
+) -> Result<Json<enrollment::Challenge>> {
+    let key = parse_key(&q.public_key)?;
+    let nonce = parse_key(&q.client_nonce)?;
+    let (challenge, pending) = enrollment::issue(key, q.endpoint, nonce, &s.registration_audience)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.prepare_enrollment(parse_key(&challenge.id)?, pending)
+        .await
+        .map_err(status)?;
+    Ok(Json(challenge))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -294,6 +326,7 @@ pub fn router(s: Arc<Coordinator>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/register", post(register))
+        .route("/v1/register/challenge", post(challenge))
         .route("/v1/peers", get(get_peers))
         .route("/v1/verify", post(verify_peer))
         .route("/v1/candidates", post(candidates))

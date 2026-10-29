@@ -77,20 +77,40 @@ enum Command {
         who: Credentials,
         reply: Reply<Vec<PunchHint>>,
     },
+    PrepareEnrollment {
+        id: Key,
+        pending: crate::enrollment::Pending,
+        reply: Reply<()>,
+    },
+    FinishEnrollment {
+        key: Key,
+        endpoint: SocketAddr,
+        id: Key,
+        answer_hash: Key,
+        token_hash: Key,
+        reply: Reply<u64>,
+    },
     Cleanup(Reply<()>),
     Len(Reply<usize>),
 }
 pub struct Coordinator {
+    pub registration_audience: String,
     commands: mpsc::UnboundedSender<Command>,
 }
 impl Coordinator {
     /// Must be called inside a Tokio runtime. Dropping all handles closes the owner task.
     pub fn new(config: Config) -> Arc<Self> {
+        Self::with_audience(config, "http://localhost/".into())
+    }
+    pub fn with_audience(config: Config, registration_audience: String) -> Arc<Self> {
         let registry = Registry::new(config);
         let (commands, receiver) = mpsc::unbounded_channel();
         let start = Instant::now();
         tokio::spawn(run(registry, receiver, start));
-        Arc::new(Self { commands })
+        Arc::new(Self {
+            commands,
+            registration_audience,
+        })
     }
     async fn call<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T> {
         let (reply, response) = oneshot::channel();
@@ -98,6 +118,32 @@ impl Coordinator {
             .send(command(reply))
             .map_err(|_| Error::Unavailable)?;
         response.await.map_err(|_| Error::Unavailable)?
+    }
+    pub async fn prepare_enrollment(
+        &self,
+        id: Key,
+        pending: crate::enrollment::Pending,
+    ) -> Result<()> {
+        self.call(|reply| Command::PrepareEnrollment { id, pending, reply })
+            .await
+    }
+    pub async fn finish_enrollment(
+        &self,
+        key: Key,
+        endpoint: SocketAddr,
+        id: Key,
+        answer_hash: Key,
+        token_hash: Key,
+    ) -> Result<u64> {
+        self.call(|reply| Command::FinishEnrollment {
+            key,
+            endpoint,
+            id,
+            answer_hash,
+            token_hash,
+            reply,
+        })
+        .await
     }
     pub async fn register_or_refresh(
         &self,
@@ -235,6 +281,8 @@ async fn run(
                 let Some(command) = command else { break; };
                 let now = start.elapsed().as_secs();
                 match command {
+                    Command::PrepareEnrollment{id,pending,reply}=>{if !reply.is_closed(){let _=reply.send(registry.prepare_enrollment(id,pending,now));}},
+                    Command::FinishEnrollment{key,endpoint,id,answer_hash,token_hash,reply}=>{if !reply.is_closed(){let _=reply.send(registry.finish_enrollment(key,endpoint,id,answer_hash,token_hash,now));}},
                     Command::Register { key, endpoint, credentials, token_hash, reply } => {
                         if !reply.is_closed() { let _ = reply.send(registry.register_or_refresh(key, endpoint, credentials, token_hash, now)); }
                     },
@@ -307,7 +355,10 @@ mod tests {
     #[tokio::test]
     async fn owner_failure_is_reported_as_unavailable() {
         let (commands, receiver) = mpsc::unbounded_channel();
-        let handle = Coordinator { commands };
+        let handle = Coordinator {
+            commands,
+            registration_audience: "http://localhost/".into(),
+        };
         drop(receiver);
         assert_eq!(handle.len().await, Err(Error::Unavailable));
     }

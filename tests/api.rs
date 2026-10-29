@@ -7,10 +7,56 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use supertrackr::{Config, Coordinator, router};
 use tower::ServiceExt;
-fn key(n: u64) -> String {
-    format!("{n:064x}")
+fn secrets() -> &'static std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>> {
+    static KEYS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+    > = std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default)
 }
+fn key(n: u64) -> String {
+    use sha2::Digest;
+    let bytes: [u8; 32] = sha2::Sha256::digest(n.to_be_bytes()).into();
+    let secret = boringtun::x25519::StaticSecret::from(bytes);
+    let key = hex::encode(boringtun::x25519::PublicKey::from(&secret).as_bytes());
+    secrets().lock().unwrap().insert(key.clone(), bytes);
+    key
+}
+// Existing lifecycle tests use full proof-bearing enrollment through this helper.
 async fn call(
+    app: &Router,
+    method: &str,
+    path: &str,
+    who: Option<(&str, &str)>,
+    mut body: Value,
+) -> (StatusCode, Value) {
+    if method == "POST" && path == "/v1/register" && who.is_none() && body.get("proof").is_none() {
+        let bytes = body["public_key"]
+            .as_str()
+            .and_then(|key| secrets().lock().unwrap().get(key).copied());
+        if let Some(bytes) = bytes {
+            let nonce = rand::random::<[u8; 32]>();
+            let(code,value)=call_raw(app,"POST","/v1/register/challenge",None,json!({"public_key":body["public_key"],"endpoint":body["endpoint"],"client_nonce":hex::encode(nonce)})).await;
+            if code != StatusCode::OK {
+                return (code, value);
+            }
+            let c = serde_json::from_value(value).unwrap();
+            let endpoint = body["endpoint"].as_str().unwrap().parse().unwrap();
+            body["proof"] = serde_json::to_value(
+                supertrackr::enrollment::solve(
+                    &c,
+                    &boringtun::x25519::StaticSecret::from(bytes),
+                    endpoint,
+                    nonce,
+                    "http://localhost/",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    call_raw(app, method, path, who, body).await
+}
+async fn call_raw(
     app: &Router,
     method: &str,
     path: &str,
@@ -877,4 +923,107 @@ async fn optional_rendezvous_binding_is_server_owned_and_does_not_grant_relay() 
     );
     let (_, events) = call(&app, "GET", "/v1/events", Some((&b, &bt)), Value::Null).await;
     assert_eq!(events["requests"], json!([]));
+}
+
+#[tokio::test]
+async fn anonymous_enrollment_requires_scoped_proof_and_never_overwrites() {
+    use boringtun::x25519::StaticSecret;
+    use supertrackr::enrollment::{Challenge, solve};
+    let state = Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    });
+    let app = router(state.clone());
+    let k = key(9001);
+    let secret = StaticSecret::from(*secrets().lock().unwrap().get(&k).unwrap());
+    let endpoint = "127.0.0.1:51820".parse().unwrap();
+    let request = json!({"public_key":k,"endpoint":endpoint});
+    assert_eq!(
+        call_raw(&app, "POST", "/v1/register", None, request.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let nonce = [5; 32];
+    let mut challenges = Vec::new();
+    for _ in 0..2 {
+        let (status, body) = call_raw(
+            &app,
+            "POST",
+            "/v1/register/challenge",
+            None,
+            json!({"public_key":k,"endpoint":endpoint,"client_nonce":hex::encode(nonce)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        challenges.push(serde_json::from_value::<Challenge>(body).unwrap());
+    }
+    assert_eq!(state.len().await.unwrap(), 0); // A challenge cannot squat on a key.
+    let c = &challenges[0];
+    assert!(
+        solve(
+            c,
+            &StaticSecret::from([99; 32]),
+            endpoint,
+            nonce,
+            "http://localhost/"
+        )
+        .is_err()
+    );
+    let mut q = request.clone();
+    q["proof"] =
+        serde_json::to_value(solve(c, &secret, endpoint, nonce, "https://other.example/").unwrap())
+            .unwrap();
+    assert_eq!(
+        call_raw(&app, "POST", "/v1/register", None, q.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    q["proof"] =
+        serde_json::to_value(solve(c, &secret, endpoint, nonce, "http://localhost/").unwrap())
+            .unwrap();
+    let mut wrong = q.clone();
+    wrong["endpoint"] = json!("127.0.0.1:51821");
+    assert_eq!(
+        call_raw(&app, "POST", "/v1/register", None, wrong).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let mut wrong = q.clone();
+    wrong["public_key"] = json!(key(9002));
+    assert_eq!(
+        call_raw(&app, "POST", "/v1/register", None, wrong).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, registered) = call_raw(&app, "POST", "/v1/register", None, q.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        call_raw(&app, "POST", "/v1/register", None, q.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    q["proof"] = serde_json::to_value(
+        solve(
+            &challenges[1],
+            &secret,
+            endpoint,
+            nonce,
+            "http://localhost/",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        call_raw(&app, "POST", "/v1/register", None, q).await.0,
+        StatusCode::CONFLICT
+    );
+    let token = registered["token"].as_str().unwrap();
+    assert_eq!(
+        call_raw(&app, "POST", "/v1/register", Some((&k, token)), request)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(state.len().await.unwrap(), 1);
 }

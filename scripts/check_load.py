@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the built load binary against valid and deliberately invalid HTTP replies."""
-import json, os, subprocess, threading
+import argparse, json, os, subprocess, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -25,15 +25,17 @@ class Handler(BaseHTTPRequestHandler):
                         'endpoint': q['endpoint'], 'remaining_seconds': 300})
 
 root = Path(__file__).resolve().parents[1]
+parser=argparse.ArgumentParser();parser.add_argument('--bin-dir',default='target/release');args=parser.parse_args()
+bins=(root/args.bin_dir).resolve()
 for invalid in [False, True]:
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.invalid = invalid
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        run = subprocess.run([str(root/'target/release/load'), '--url',
+        run = subprocess.run([str(bins/'load'), '--url',
             f'http://127.0.0.1:{server.server_port}', '--rate', '10', '--seconds', '1',
-            '--population', '2', '--workers', '1'], capture_output=True, text=True,
+            '--calibration-only', '--population', '2', '--workers', '1'], capture_output=True, text=True,
             env=dict(os.environ, TOKIO_WORKER_THREADS='2'), timeout=20)
         result = json.loads(run.stdout)
         accepted = result['accepted']

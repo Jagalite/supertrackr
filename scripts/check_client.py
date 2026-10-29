@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Two real client processes, HTTP coordination, and loopback WireGuard data."""
-import hashlib, json, signal, socket, subprocess, tempfile, time
+import argparse, hashlib, json, signal, socket, subprocess, tempfile, time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
+parser=argparse.ArgumentParser();parser.add_argument('--bin-dir',default='target/release');args=parser.parse_args()
+bins=(ROOT/args.bin_dir).resolve()
 folder=ROOT/'bench/results'/time.strftime('client-%Y%m%d-%H%M%S')
 folder.mkdir(parents=True)
 manifest={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
-          for p in [ROOT/'Cargo.toml',ROOT/'Cargo.lock',Path(__file__),*sorted((ROOT/'src').rglob('*.rs')),ROOT/'target/release/client',ROOT/'target/release/supertrackr']}
+          for p in [ROOT/'Cargo.toml',ROOT/'Cargo.lock',Path(__file__),*sorted((ROOT/'src').rglob('*.rs')),bins/'client',bins/'supertrackr']}
 (folder/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 processes=[]; files=[]
 def interrupted(signum, _frame):
@@ -28,7 +30,7 @@ def await_event(name,event,proc):
 try:
     with tempfile.TemporaryDirectory(prefix='supertrackr-client-keys-') as keydir:
         with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
-        server=launch('server',[str(ROOT/'target/release/supertrackr'),'--listen',f'127.0.0.1:{port}','--lab-http','--open-registration','--capacity','100','--ttl-seconds','3'])
+        server=launch('server',[str(bins/'supertrackr'),'--listen',f'127.0.0.1:{port}','--lab-http','--open-registration','--capacity','100','--ttl-seconds','3'])
         for _ in range(100):
             try:
                 with socket.create_connection(('127.0.0.1',port),timeout=.1):break
@@ -38,7 +40,7 @@ try:
         else:raise RuntimeError('server did not listen')
         clients={}
         for name,local,remote in [('a','10.77.0.1','10.77.0.2'),('b','10.77.0.2','10.77.0.1')]:
-            clients[name]=launch(name,[str(ROOT/'target/release/client'),'--server',f'http://127.0.0.1:{port}','--lab-http',
+            clients[name]=launch(name,[str(bins/'client'),'--server',f'http://127.0.0.1:{port}','--lab-http',
                 '--key-file',str(Path(keydir)/name),'--tunnel-ip',local,'--peer-ip',remote,'--run-seconds','8'])
         ready={name:await_event(name,'ready',proc) for name,proc in clients.items()}
         verified={name:await_event(name,'peer_verified',proc) for name,proc in clients.items()}

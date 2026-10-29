@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
         endpoint,
         initial.clone(),
         a.introduction,
+        &secret,
     )
     .await?;
     let adapter = interface::Adapter::new(

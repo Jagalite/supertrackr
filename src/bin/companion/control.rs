@@ -32,6 +32,7 @@ impl Control {
         endpoint: SocketAddr,
         candidates: Vec<SocketAddr>,
         introduction: IntroductionMode,
+        secret: &boringtun::x25519::StaticSecret,
     ) -> Result<(Self, InterfaceInfo)> {
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -39,14 +40,8 @@ impl Control {
             .timeout(Duration::from_secs(2))
             .build()?;
         let at = Instant::now();
-        let r: RegistrationResponse = http
-            .post(base.join("v1/register")?)
-            .json(&json!({"public_key":public,"endpoint":endpoint}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let r: RegistrationResponse =
+            supertrackr::enrollment::register(&http, &base, secret, endpoint).await?;
         if !(3..=86400).contains(&r.expires_in_seconds) {
             return Err("companion requires server TTL of at least three seconds".into());
         }

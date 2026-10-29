@@ -55,6 +55,8 @@ struct Record {
 }
 pub struct Registry {
     records: HashMap<Key, Record>,
+    enrollments: HashMap<Key, crate::enrollment::Pending>,
+    enrollment_expiry: std::collections::BTreeSet<(u64, Key)>,
     discovery_keys: Vec<Key>,
     cursor: usize,
     cleanup_cursor: usize,
@@ -75,6 +77,8 @@ impl Registry {
         assert!(config.capacity > 0 && (1..=86400).contains(&config.ttl_seconds));
         Self {
             records: HashMap::with_capacity(config.capacity),
+            enrollments: HashMap::new(),
+            enrollment_expiry: std::collections::BTreeSet::new(),
             discovery_keys: Vec::with_capacity(config.capacity),
             cursor: 0,
             cleanup_cursor: 0,
@@ -120,6 +124,71 @@ impl Registry {
             endpoint: record.expect("model allowed existing peer").endpoint,
             remaining_seconds,
         })
+    }
+    fn expire_enrollments(&mut self, now: u64) {
+        for _ in 0..64 {
+            let Some(&(until, id)) = self.enrollment_expiry.first() else {
+                break;
+            };
+            if until > now {
+                break;
+            }
+            self.enrollment_expiry.remove(&(until, id));
+            self.enrollments.remove(&id);
+        }
+    }
+    pub fn prepare_enrollment(
+        &mut self,
+        id: Key,
+        mut pending: crate::enrollment::Pending,
+        now: u64,
+    ) -> Result<()> {
+        self.expire_enrollments(now);
+        if !self.config.open_registration {
+            return Err(Error::Forbidden);
+        }
+        if self.records.contains_key(&pending.key) {
+            return Err(Error::Conflict);
+        }
+        if self.records.len() >= self.config.capacity || self.enrollments.len() >= 4096 {
+            return Err(Error::Unavailable);
+        }
+        if pending.endpoint.port() == 0
+            || pending.endpoint.ip().is_unspecified()
+            || pending.endpoint.ip().is_multicast()
+        {
+            return Err(Error::BadRequest);
+        }
+        if self.enrollments.contains_key(&id) {
+            return Err(Error::Conflict);
+        }
+        pending.until = now.saturating_add(30);
+        self.enrollment_expiry.insert((pending.until, id));
+        self.enrollments.insert(id, pending);
+        Ok(())
+    }
+    pub fn finish_enrollment(
+        &mut self,
+        key: Key,
+        endpoint: SocketAddr,
+        id: Key,
+        answer_hash: Key,
+        token_hash: Key,
+        now: u64,
+    ) -> Result<u64> {
+        self.expire_enrollments(now);
+        let pending = self.enrollments.get(&id).ok_or(Error::Unauthorized)?;
+        if pending.until <= now
+            || pending.key != key
+            || pending.endpoint != endpoint
+            || !bool::from(pending.answer_hash.ct_eq(&answer_hash))
+        {
+            return Err(Error::Unauthorized);
+        }
+        let until = pending.until;
+        self.enrollments.remove(&id);
+        self.enrollment_expiry.remove(&(until, id));
+        self.register_or_refresh(key, endpoint, None, token_hash, now)
     }
     pub fn register_or_refresh(
         &mut self,
@@ -248,6 +317,7 @@ impl Registry {
     /// Bounded maintenance for the owner loop. Authorization checks expiry independently.
     /// Swap removal avoids rebuilding or shifting the entire discovery index.
     pub fn cleanup_batch(&mut self, now: u64, budget: usize) {
+        self.expire_enrollments(now);
         for _ in 0..budget.min(self.discovery_keys.len()) {
             if self.discovery_keys.is_empty() {
                 break;
@@ -283,6 +353,52 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn enrollment_expiry_replay_and_resource_bounds() {
+        let mut core = Registry::new(Config {
+            open_registration: true,
+            ttl_seconds: 1,
+            ..Config::default()
+        });
+        let endpoint = "127.0.0.1:10".parse().unwrap();
+        let pending = || crate::enrollment::Pending {
+            key: [1; 32],
+            endpoint,
+            answer_hash: [2; 32],
+            until: 0,
+        };
+        core.prepare_enrollment([3; 32], pending(), 0).unwrap();
+        assert_eq!(
+            core.finish_enrollment([1; 32], endpoint, [3; 32], [2; 32], [4; 32], 30),
+            Err(Error::Unauthorized)
+        );
+        assert!(core.is_empty());
+        core.prepare_enrollment([3; 32], pending(), 31).unwrap();
+        core.finish_enrollment([1; 32], endpoint, [3; 32], [2; 32], [4; 32], 31)
+            .unwrap();
+        core.cleanup_batch(32, 4096);
+        assert!(core.is_empty());
+        assert_eq!(
+            core.finish_enrollment([1; 32], endpoint, [3; 32], [2; 32], [4; 32], 32),
+            Err(Error::Unauthorized)
+        );
+        for n in 0..4096u64 {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            core.prepare_enrollment(id, pending(), 40).unwrap();
+        }
+        assert_eq!(
+            core.prepare_enrollment([9; 32], pending(), 40),
+            Err(Error::Unavailable)
+        );
+        assert!(core.is_empty());
+        for _ in 0..64 {
+            core.cleanup_batch(70, 0);
+        }
+        assert!(core.enrollments.is_empty());
+        assert!(core.enrollment_expiry.is_empty());
+        core.prepare_enrollment([9; 32], pending(), 70).unwrap();
+    }
     #[test]
     fn bounded_cleanup_preserves_refresh_discovery_and_reuse() {
         let mut core = Registry::new(Config {

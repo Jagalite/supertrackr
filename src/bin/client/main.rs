@@ -352,7 +352,7 @@ async fn main() -> Result<()> {
         a.candidate.clone()
     };
     let mapping = mapping::Mapping::new(a.portmap, endpoint.port())?;
-    let control = control::Control::register(base, public.clone(), endpoint).await?;
+    let control = control::Control::register(base, public.clone(), endpoint, &secret).await?;
     let mut expires = control.expires();
     let (candidate_tx, candidate_rx) = tokio::sync::watch::channel(host_candidates.clone());
     let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(32);

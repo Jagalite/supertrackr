@@ -65,6 +65,7 @@ def arm(kind, mode, repeat):
                 except OSError: time.sleep(.05)
             else: raise RuntimeError('server did not listen')
             load=[str(ROOT/'target/release/load'),'--url',f'http://127.0.0.1:{port}','--mode',mode,'--rate',str(a.rate),'--seconds',str(a.seconds),'--population',str(a.population),'--workers',str(a.workers),'--peer-limit',str(a.peer_limit)]
+            if kind=='calibration': load.append('--calibration-only')
             child=subprocess.Popen(load,stdout=output,stderr=errors,text=True,env=load_env)
             peak=0
             load_peak=0

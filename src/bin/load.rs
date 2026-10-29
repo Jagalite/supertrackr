@@ -17,6 +17,9 @@ struct Args {
     url: String,
     #[arg(long)]
     ca: Option<String>,
+    /// Skip key proof only against loopback response-shape calibration fixtures.
+    #[arg(long)]
+    calibration_only: bool,
     #[arg(long, default_value = "verify")]
     mode: String,
     #[arg(long, default_value_t = 5000)]
@@ -55,18 +58,43 @@ struct RegistrationResponse {
     expires_in_seconds: u64,
 }
 fn key(seed: u64, n: usize) -> String {
-    hex::encode(Sha256::digest(format!("{seed}/{n}")))
+    hex::encode(boringtun::x25519::PublicKey::from(&secret(seed, n)).as_bytes())
 }
-async fn register(c: &Client, url: &str, k: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let r: Value = c
-        .post(format!("{url}/v1/register"))
-        .json(&json!({"public_key":k,"endpoint":"127.0.0.1:51820"}))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
+fn secret(seed: u64, n: usize) -> boringtun::x25519::StaticSecret {
+    boringtun::x25519::StaticSecret::from(<[u8; 32]>::from(Sha256::digest(format!("{seed}/{n}"))))
+}
+async fn enroll(
+    c: &Client,
+    base: &reqwest::Url,
+    secret: &boringtun::x25519::StaticSecret,
+    calibration: bool,
+    direct: &mut Option<Direct>,
+) -> Result<(u16, Bytes), LoadError> {
+    let key = hex::encode(boringtun::x25519::PublicKey::from(secret).as_bytes());
+    let endpoint = "127.0.0.1:51820".parse().unwrap();
+    let mut body = json!({"public_key":key,"endpoint":"127.0.0.1:51820"});
+    if !calibration {
+        let nonce = rand::random::<[u8; 32]>();
+        let (status, bytes) = send(
+            c.post(base.join("v1/register/challenge")?).json(
+                &json!({"public_key":key,"endpoint":endpoint,"client_nonce":hex::encode(nonce)}),
+            ),
+            direct,
+        )
         .await?;
-    Ok(r["token"].as_str().ok_or("missing token")?.into())
+        if status != 200 {
+            return Ok((status, bytes));
+        }
+        let challenge = serde_json::from_slice(&bytes)?;
+        body["proof"] = serde_json::to_value(supertrackr::enrollment::solve(
+            &challenge,
+            secret,
+            endpoint,
+            nonce,
+            base.as_str(),
+        )?)?;
+    }
+    send(c.post(base.join("v1/register")?).json(&body), direct).await
 }
 fn client(ca: Option<&str>) -> Result<Client, Box<dyn std::error::Error>> {
     let mut builder = Client::builder()
@@ -141,6 +169,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("plaintext benchmark target must be a loopback IP".into());
     }
+    if a.calibration_only
+        && (endpoint.scheme() != "http"
+            || !endpoint
+                .host_str()
+                .and_then(|h| h.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|ip| ip.is_loopback()))
+    {
+        return Err("calibration-only requires loopback HTTP".into());
+    }
     let c = client(a.ca.as_deref())?;
     let seed = rand::random::<u64>();
     let mut identities = Vec::with_capacity(a.population);
@@ -159,7 +196,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _: Announce = serde_bencode::from_bytes(&response)?;
             String::new()
         } else {
-            register(&c, &a.url, &k).await?
+            {
+                let (status, body) = enroll(
+                    &c,
+                    &endpoint,
+                    &secret(seed, i),
+                    a.calibration_only,
+                    &mut None,
+                )
+                .await
+                .map_err(|e| e as Box<dyn std::error::Error>)?;
+                if status != 200 {
+                    return Err(format!("enrollment returned {status}").into());
+                }
+                serde_json::from_slice::<RegistrationResponse>(&body)?.token
+            }
         };
         identities.push((k, t));
     }
@@ -216,6 +267,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
+        let base = endpoint.clone();
+        let calibration = a.calibration_only;
         handles.push(tokio::spawn(async move {
             let mut s = Stats::default();
             while let Some((i, planned, enqueued)) = rx.recv().await {
@@ -245,7 +298,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .bearer_auth(&caller.1),
                 };
                 let sent = Instant::now();
-                match tokio::time::timeout(Duration::from_secs(3), send(req, &mut direct)).await {
+                match tokio::time::timeout(Duration::from_secs(3), async {
+                    if mode == "register" {
+                        enroll(&c, &base, &secret(seed,population+i), calibration, &mut direct).await
+                    } else { send(req, &mut direct).await }
+                }).await {
                     Ok(Ok((status, bytes))) => {
                         *s.statuses.entry(status).or_default() += 1;
                         let good = match status {
@@ -370,7 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let passed = accepted == total && all.success == total && all.errors == 0;
     println!(
         "{}",
-        json!({"slow_samples":all.slow_samples,"diagnostics":diagnostics,"pacing":"dedicated-thread-250us","mode":a.mode,"peer_limit":a.peer_limit,"response_bytes":all.response_bytes,"service_p99_us":all.service_lat.get(all.service_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"target_rps":a.rate,"duration_seconds":a.seconds,"population":a.population,"setup_ms":setup_ms,"workers":a.workers,"queue_mode":"unbounded","queue_per_worker":null,"queue_wait_p99_us":all.queue_lat.get(all.queue_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"queue_wait_max_us":all.queue_lat.last().copied().unwrap_or(0),"offered":total,"accepted":accepted,"late":late,"queue_dropped":0,"channel_closed":closed,"success":all.success,"errors":all.errors,"statuses":all.statuses,"e2e_p50_us":percentile(50),"e2e_p95_us":percentile(95),"e2e_p99_us":percentile(99),"offer_ms":offer_ms,"elapsed_ms":elapsed.as_millis(),"drain_ms":elapsed.as_millis().saturating_sub(offer_ms),"passed":passed,"latency_scope":"successful requests, from scheduled offer through complete validated response","transport":if endpoint.scheme() == "http" {"http HTTP/1.1 worker-owned hyper"} else {"https HTTP/1.1 reqwest"}})
+        json!({"calibration_only":a.calibration_only,"registration_workflow":if a.calibration_only {"fixture only; no proof"} else {"encrypted challenge plus proof completion"},"slow_samples":all.slow_samples,"diagnostics":diagnostics,"pacing":"dedicated-thread-250us","mode":a.mode,"peer_limit":a.peer_limit,"response_bytes":all.response_bytes,"service_p99_us":all.service_lat.get(all.service_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"target_rps":a.rate,"duration_seconds":a.seconds,"population":a.population,"setup_ms":setup_ms,"workers":a.workers,"queue_mode":"unbounded","queue_per_worker":null,"queue_wait_p99_us":all.queue_lat.get(all.queue_lat.len().saturating_sub(1)*99/100).copied().unwrap_or(0),"queue_wait_max_us":all.queue_lat.last().copied().unwrap_or(0),"offered":total,"accepted":accepted,"late":late,"queue_dropped":0,"channel_closed":closed,"success":all.success,"errors":all.errors,"statuses":all.statuses,"e2e_p50_us":percentile(50),"e2e_p95_us":percentile(95),"e2e_p99_us":percentile(99),"offer_ms":offer_ms,"elapsed_ms":elapsed.as_millis(),"drain_ms":elapsed.as_millis().saturating_sub(offer_ms),"passed":passed,"latency_scope":"successful requests, from scheduled offer through complete validated response","transport":if endpoint.scheme() == "http" {"http HTTP/1.1 worker-owned hyper"} else {"https HTTP/1.1 reqwest"}})
     );
     if !passed {
         std::process::exit(2);

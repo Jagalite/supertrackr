@@ -5,6 +5,9 @@ use supertrackr::{Config, Coordinator, router};
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8443")]
     listen: SocketAddr,
+    /// Canonical public origin binding anonymous enrollment proofs (required for HTTPS).
+    #[arg(long)]
+    public_origin: Option<reqwest::Url>,
     #[arg(long)]
     cert: Option<PathBuf>,
     #[arg(long)]
@@ -52,11 +55,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?,
         )
     };
-    let state = Coordinator::new(Config {
-        capacity: a.capacity,
-        ttl_seconds: a.ttl_seconds,
-        open_registration: a.open_registration,
-    });
+    let origin = match a.public_origin {
+        Some(origin) => origin,
+        None if a.lab_http => format!("http://{}/", a.listen).parse()?,
+        None => {
+            return Err("HTTPS server requires --public-origin https://tracker.example/".into());
+        }
+    };
+    if origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || (!a.lab_http && origin.scheme() != "https")
+        || (a.lab_http
+            && (origin.scheme() != "http"
+                || !origin.host_str().is_some_and(|s| {
+                    s.parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+                })))
+    {
+        return Err("invalid public origin".into());
+    }
+    let state = Coordinator::with_audience(
+        Config {
+            capacity: a.capacity,
+            ttl_seconds: a.ttl_seconds,
+            open_registration: a.open_registration,
+        },
+        origin.to_string(),
+    );
     eprintln!(
         "Listening on {}; RAM-only prototype; open_registration={}",
         a.listen, a.open_registration

@@ -27,6 +27,7 @@ impl Control {
         base: reqwest::Url,
         public: String,
         endpoint: SocketAddr,
+        secret: &boringtun::x25519::StaticSecret,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -34,14 +35,8 @@ impl Control {
             .timeout(Duration::from_secs(2))
             .build()?;
         let start = Instant::now();
-        let r: RegistrationResponse = http
-            .post(base.join("v1/register")?)
-            .json(&json!({"public_key":public,"endpoint":endpoint}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let r: RegistrationResponse =
+            supertrackr::enrollment::register(&http, &base, secret, endpoint).await?;
         let mut raw = [0; 32];
         if !(1..=86400).contains(&r.expires_in_seconds)
             || hex::decode_to_slice(&r.token, &mut raw).is_err()

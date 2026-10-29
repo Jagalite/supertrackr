@@ -564,3 +564,89 @@ unknown. Neither negative outcome is a claim about every real NAT of that class.
 
 Receipts: `bench/results/tailscale-audit-20261029/`. All traffic used raw-IP test
 adapters, not a privileged macOS interface or real TCP application sockets.
+
+## Anonymous enrollment validation — 2026-10-29
+
+New registrations now require an encrypted X25519 key-possession challenge and
+proof completion; refresh still uses its bearer token. Previous one-request
+registration measurements do not measure this two-request workflow. No new
+high-rate capacity claim is made.
+
+Executed validation: 50 Rust tests passed (25 library, 6 lab client, 7 companion,
+12 API). Test compilation used Kyoto job `659b6a0f34c1404f83fb5587440c8191`, then
+all emitted test binaries were executed. Clippy all targets/all features with
+warnings denied passed in job `20e478e7fcb4431b949ecfa07aa20bd1`.
+
+Both debug lab clients enrolled, refreshed five times each and received encrypted
+pongs. The mixed-mode companion raw-IP adapter test passed all 12 directed protocol
+checks, rejected forged inner source traffic, and recovered from simulated UDP
+outage and mapping rebind. These are loopback/user-space NAT simulation results,
+not privileged utun or Internet NAT qualification. An initial companion invocation
+during build activity failed to start its server; the completed-build run passed.
+
+Debug load functional receipts: `bench/results/enrollment-20261029/`. At 10 offers
+per second for one second, registration completed 10/10 with zero errors. Refresh
+and verify runs completed 9/9 admitted operations, with one late unsent offer each;
+their performance gate correctly remained false, including the refresh follow-up.
+Both response-shape fixture checks passed (valid response accepted, wrong key
+rejected), explicitly using `--calibration-only`. These checks establish functional
+integration only; fixture calibration omits the enrollment proof workload.
+
+## Userspace connection API validation — 2026-10-29
+
+Added `userspace::Network`, a poll-driven smoltcp TCP/UDP stack behind the shared
+WireGuard peer manager. This is functional validation, not a throughput benchmark.
+All 53 tests passed after Kyoto test compilation `785cbdbe8d1340668e060686bc09676c`
+and direct execution of all emitted binaries. The three userspace tests were
+recompiled in `ce936da223c14c8d82638e239650b710` and executed again after tightening
+the loss injection to encrypted data packets larger than 200 bytes. All passed:
+64 KiB TCP transfer with loss, half-close, listener reuse, UDP boundaries, socket
+limits/handles, unknown-peer resolution, untrusted input and local expiry.
+
+Clippy all targets/all features with warnings denied passed in
+`86e5e918698748299cff7fb441d2ced9`. The example initially requested its interface
+before publishing candidates and received 404; that ordering was corrected.
+The rebuilt `userspace_echo` (`b7bfce8a5aad4e2abb05fc0801834df4`) then executed
+successfully: two proof-enrolled peers obtained tracker bindings and echoed TCP
+and UDP through real loopback WireGuard datagrams, with no virtual interface.
+No Internet NAT or production performance qualification is implied.
+
+## Tokio userspace API validation — 2026-10-29
+
+`async_userspace::Client` now owns the polling engine and outer UDP transport in
+one task. TCP handles implement Tokio AsyncRead/AsyncWrite; TCP accept/connect
+and UDP send/receive are awaitable. Tracker control remains explicit.
+
+Executed 62 tests: the existing 53 plus 9 async integration tests. Full compilation
+used Kyoto `72e780970c064e65bdc319b5b9526faa`; the final async test revision used
+`9242d59ed5844e4699aa3f44962da77d`. All corresponding binaries were executed.
+Async checks cover 256 KiB transfer/half-close, shutdown-and-drop byte preservation,
+final-owner draining and transport release, independent UDP progress under TCP
+backpressure, 80 cancelled connects with complete capacity recovery, UDP receive
+cancellation and bounds, expiry/explicit shutdown waking blocked operations, and
+an incompatible address candidate not terminating a usable path. The candidate
+check initially asserted before the scheduled probe; it now waits for that probe
+and passed. Clippy all targets/all features with warnings denied passed via
+`318fb14ce1b34dbaa33895356fe00acf`.
+
+The updated `userspace_echo` executable also passed: proof-bearing enrollment,
+tracker-provided reciprocal bindings, and async TCP/UDP echo over real loopback
+WireGuard sockets without application polling or virtual interfaces. This remains
+functional transport evidence, not Internet NAT or throughput qualification.
+Kyoto intermittently deferred compilation for host memory pressure; final test
+compilation used a single Cargo job without changing shared queue policy.
+
+## Listener recovery fix validation — 2026-10-29
+
+Closed pending TCP listeners now re-arm in place when accepted again. The same
+listener ID/port is retained, and recovery does not require an additional socket
+slot. Capacity is checked only when accepting an established connection.
+
+Kyoto compilation `c919550d3a0d43abaaddc773fa2fb408` succeeded; both emitted test
+binaries were then executed: 4 userspace and 9 async userspace tests passed.
+The new regression reproduces a dropped SYN-ACK timeout, re-arms at all 64 slots
+occupied, completes a new handshake, preserves pending connection data while
+acceptance is capacity-blocked, and transfers that data after freeing one slot.
+Clippy job `e9962fd74ad34987a6a8de2e11e8070d` subsequently succeeded (exit 0)
+for the library and both userspace test targets with warnings denied. Kyoto's
+normal scheduling was preserved while the checks remained queued.

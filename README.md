@@ -22,7 +22,7 @@ TOKIO_WORKER_THREADS=2 target/release/supertrackr \
 ```
 
 `--lab-http` explicitly permits plaintext on a loopback IP only. Without it,
-`--cert` and `--key` PEM files are required. Certificate provisioning and HTTPS
+`--cert` and `--key` PEM files plus `--public-origin https://tracker.example/` are required. Certificate provisioning and HTTPS
 qualification are deferred. Registration is closed unless `--open-registration`
 is supplied. No UDP listener, VM, database, or Tailscale client is required.
 
@@ -31,10 +31,14 @@ is supplied. No UDP listener, VM, database, or Tailscale client is required.
 Public keys are 64 hexadecimal characters encoding 32 bytes. Endpoint hints
 are socket addresses such as `127.0.0.1:51820`.
 
-- `POST /v1/register`: JSON `{"public_key":"…","endpoint":"127.0.0.1:51820"}`.
-  With no credentials, creates a registration and returns a random session token
-  plus `expires_in_seconds`. With matching caller credentials, refreshes the lease
-  and endpoint, returning the same token. A public key alone cannot overwrite a record.
+- `POST /v1/register/challenge`: JSON `{"public_key":"…","endpoint":"127.0.0.1:51820","client_nonce":"<32 random bytes as hex>"}`.
+  Returns `id`, `server_key`, `nonce`, and `ciphertext` for a 30-second encrypted
+  key-possession challenge. Requires `--open-registration`; creates no registration.
+- `POST /v1/register`: JSON `{"public_key":"…","endpoint":"127.0.0.1:51820","proof":{"id":"…","response":"…"}}`.
+  Without credentials, consumes a valid proof and returns a random session token
+  plus `expires_in_seconds`. Both bundled clients perform this exchange automatically.
+  With matching caller credentials, omit `proof` to refresh the lease and endpoint,
+  returning the same token. An established registration cannot be overwritten.
 - `GET /v1/peers?limit=20`: returns an array of peers with `public_key`, `endpoint`
   and `remaining_seconds`. Excludes the caller; accepts a limit of 1–100.
 - `POST /v1/verify`: JSON with the incoming peer's `public_key` and `endpoint`.
@@ -56,11 +60,13 @@ time. Private WireGuard keys are never sent to this server.
 
 ## Prototype policy and boundaries
 
-All live registrations may discover and verify each other. Open registration is
-**not WireGuard private-key proof of possession** and permits key squatting.
-There is no account, invitation or swarm policy. Verification establishes a current
-registered binding, not endpoint reachability or successful WireGuard configuration.
-The WireGuard handshake will authenticate key possession on clients.
+All live registrations may discover and verify each other. Public registration
+is account-free: no name, email, or real-world identity is required. Enrollment
+proves control of the WireGuard private key; the public key is a pseudonymous
+identity. It does not hide IP addresses or prevent one party creating many keys.
+Rate limiting and Sybil defenses remain separate, deferred work. Verification
+checks the current registered binding, not endpoint reachability or a live tunnel.
+See [the enrollment protocol](docs/ENROLLMENT.md) for the proof and its boundaries.
 
 Registrations expire after 300 seconds by default (`--ttl-seconds`, 1–86400).
 Authenticated refresh before expiry extends the lease and can change the endpoint;
@@ -144,7 +150,10 @@ This functional check reports late offers and validates every admitted response;
 it does not qualify throughput or relax the benchmark's completeness gate.
 
 Benchmark modes are `register`, `refresh`, `peers`, and `verify`. Creation and
-refresh use the same API but are measured separately. Discovery requests 20 peers
+refresh are measured separately. Creation now includes an encrypted challenge and
+proof completion (two HTTP requests); refresh remains one request. Echo calibration
+uses `--calibration-only` and tests response handling, not the enrollment crypto
+workload. Earlier single-request creation rates are not comparable. Discovery requests 20 peers
 by default (`--peer-limit`), validates known keys/endpoints, excludes the caller,
 and rejects duplicates. The echo fixture retains at most 101 sample keys for list
 response shapes; it implements no registration or authentication policy.
@@ -230,8 +239,8 @@ Session tokens are RAM-only: after a client restart, its previous registration
 must expire before the same key can create a new session. Control failures stop
 the client; automatic reconnect is deferred. HTTP requires explicit loopback-only
 `--lab-http`; HTTPS uses normal certificate validation but has not been exercised
-by this lab. Open registration still permits key squatting and does not itself
-prove possession of a private key; the WireGuard handshake provides that proof.
+by this lab. Both clients prove key possession during enrollment; the subsequent
+WireGuard handshake independently authenticates the data connection.
 
 ## NAT and relay lab
 
@@ -400,3 +409,11 @@ python3 scripts/check_companion.py --nat --nat-mode udp-blocked
 
 The latter two must remain disconnected without relay. Recovery checks cover
 simulated UDP loss and public NAT rebinding, not actual OS interface changes.
+
+## Embedded userspace connections
+
+Rust applications can use `supertrackr::async_userspace::Client` for awaitable TCP
+and UDP over WireGuard without an OS virtual interface. TCP streams implement
+Tokio AsyncRead/AsyncWrite; one background task owns polling and UDP I/O. Tracker
+control remains explicit. The lower-level `userspace::Network` API is also available. See [the API guide](docs/USERSPACE.md) and the runnable
+[tracker-backed TCP/UDP echo example](examples/userspace_echo.rs).

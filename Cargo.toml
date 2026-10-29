@@ -9,6 +9,9 @@ default = []
 router-mapping = ["dep:portmapper"]
 
 [dependencies]
+smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+crypto_box = "=0.9.1"
+hmac = "0.12"
 tun = { version = "=0.8.14", features = ["async"] }
 portmapper = { version = "=0.20.0", default-features = false, optional = true }
 boringtun = { version = "=0.7.1", default-features = false }

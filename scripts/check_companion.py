@@ -21,11 +21,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix='stc-',dir='/tmp') as tmp:
         d=pathlib.Path(tmp)
         s=socket.socket();s.bind(('127.0.0.1',0));port=s.getsockname()[1];s.close();url=f'http://127.0.0.1:{port}/'
+        with socket.socket() as reservation:
+            reservation.bind(('127.0.0.1',0));proxy_port=reservation.getsockname()[1]
         def start(args,name):
             err=open(d/(name+'.err'),'w+');streams.append(err)
             p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=err,text=True);processes.append(p);return p
         try:
-            server=start([str(bins/'supertrackr'),'--listen',f'127.0.0.1:{port}','--lab-http','--open-registration','--ttl-seconds','30'],'server')
+            server=start([str(bins/'supertrackr'),'--listen',f'127.0.0.1:{port}','--lab-http','--open-registration','--ttl-seconds','30','--public-origin',f'http://127.0.0.1:{proxy_port}/'],'server')
             for _ in range(100):
                 try:urllib.request.urlopen(url+'health',timeout=.1).close();break
                 except OSError:time.sleep(.05)
@@ -52,7 +54,7 @@ def main():
                     except urllib.error.HTTPError as error:response=error
                     with response:
                         data=response.read();self.send_response(response.status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
-            proxy=http.server.ThreadingHTTPServer(('127.0.0.1',0),Proxy)
+            proxy=http.server.ThreadingHTTPServer(('127.0.0.1',proxy_port),Proxy)
             threading.Thread(target=proxy.serve_forever,daemon=True).start()
             url=f'http://127.0.0.1:{proxy.server_port}/'
             peers=[]

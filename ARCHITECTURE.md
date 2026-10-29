@@ -14,16 +14,19 @@ UDP tracker support, Aquatic comparison, and VM testing are deferred.
 ## Register or refresh
 
 `POST /v1/register` accepts a public key and advertised socket endpoint. Initial
-registration, enabled only by `--open-registration`, issues a random session token.
+registration, enabled only by `--open-registration`, requires a single-use encrypted
+challenge from `POST /v1/register/challenge` and issues a random session token.
 An existing registration can renew its lifetime and update its endpoint only by
 presenting its current token and the matching caller public key. Refresh keeps
 the token unchanged, consumes no extra capacity, and requires an unexpired lease.
 Expired registrations must be cleaned up and registered again with a fresh token.
 
-This prototype authenticates ownership of the session credential, not possession
-of the WireGuard private key. Open enrollment permits key squatting; stronger
-initial enrollment remains deferred. Advertised IP/port information is not proof
-of reachability or ownership of that address.
+Enrollment proves possession of the registered X25519/WireGuard private key
+without accounts or personal information. Refresh authenticates the session token.
+Challenges expire after 30 seconds, are bounded to 4,096 pending entries, and do
+not reserve identities. Proof consumption and registration happen atomically in
+the owner task. See [ENROLLMENT.md](docs/ENROLLMENT.md) for protocol details.
+Advertised IP/port information is not proof of reachability or address ownership.
 
 ## Get peers
 
@@ -340,3 +343,20 @@ improvement threshold and expiring measurements; incoming data alone cannot sele
 a path. Per-peer path state is bounded at 16 endpoints. STUN can report observed
 destination-dependent mapping when two distinct server IPs provide fresh evidence.
 This does not establish Tailscale parity or real-network qualification.
+
+## Embedded userspace TCP/IP
+
+`userspace::Network` owns an smoltcp IPv4 stack and the same `peer_manager::Manager`
+used by the companion. Its application-facing API exposes nonblocking TCP
+connect/listen/accept/read/write and UDP bind/send/receive operations. The embedding
+runtime polls it, dispatches encrypted UDP actions, and supplies authenticated
+tracker bindings. It creates no virtual interface or host routes. Local lease
+expiry fails closed; no plaintext host-network fallback exists. See
+[USERSPACE.md](docs/USERSPACE.md) for ownership, buffering and lifecycle contracts.
+
+`async_userspace::Client` adds the Tokio adapter: one task owns Network and its
+outer UDP socket, bounded channels carry commands and datagrams, and bounded
+Duplex buffers expose AsyncRead/AsyncWrite streams. The task drives timers and
+bridges packets without application polling. Authenticated peer installation and
+lease renewal remain explicit control operations. Cancellation, half-close,
+drop-draining, and terminal failure contracts are documented in USERSPACE.md.
