@@ -2,9 +2,15 @@
 name = "supertrackr"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.91"
+
+[features]
+default = []
+router-mapping = ["dep:portmapper"]
 
 [dependencies]
+tun = { version = "=0.8.14", features = ["async"] }
+portmapper = { version = "=0.20.0", default-features = false, optional = true }
 boringtun = { version = "=0.7.1", default-features = false }
 libc = "0.2"
 zeroize = "1"

@@ -9,6 +9,9 @@ struct Args {
     cert: Option<PathBuf>,
     #[arg(long)]
     key: Option<PathBuf>,
+    /// Optional UDP STUN mapping reflector (separate from the HTTP tracker).
+    #[arg(long)]
+    stun_listen: Option<SocketAddr>,
     /// Explicit plaintext HTTP for loopback benchmarks only.
     #[arg(long)]
     lab_http: bool,
@@ -29,6 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if a.lab_http && !a.listen.ip().is_loopback() {
         return Err("--lab-http requires loopback".into());
     }
+    if a.lab_http && a.stun_listen.is_some_and(|addr| !addr.ip().is_loopback()) {
+        return Err("lab STUN listener must be loopback".into());
+    }
+    let stun_socket = if let Some(addr) = a.stun_listen {
+        Some(tokio::net::UdpSocket::bind(addr).await?)
+    } else {
+        None
+    };
     let tls = if a.lab_http {
         None
     } else {
@@ -50,16 +61,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Listening on {}; RAM-only prototype; open_registration={}",
         a.listen, a.open_registration
     );
-    if let Some(tls) = tls {
-        axum_server::bind_rustls(a.listen, tls)
-            .serve(router(state).into_make_service())
+    let http = async {
+        if let Some(tls) = tls {
+            axum_server::bind_rustls(a.listen, tls)
+                .serve(router(state).into_make_service())
+                .await?;
+        } else {
+            axum::serve(
+                tokio::net::TcpListener::bind(a.listen).await?,
+                router(state),
+            )
             .await?;
-    } else {
-        axum::serve(
-            tokio::net::TcpListener::bind(a.listen).await?,
-            router(state),
-        )
-        .await?;
-    }
-    Ok(())
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    let stun = async {
+        match stun_socket {
+            Some(socket) => supertrackr::stun::serve(socket).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! { result=http=>result, result=stun=>{result?;Err("STUN task stopped".into())} }
 }

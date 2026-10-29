@@ -494,3 +494,387 @@ async fn concurrent_discovery_verification_refresh_and_cleanup() {
     }
     assert_eq!(state.len().await.unwrap(), 64);
 }
+
+#[tokio::test]
+async fn traversal_http_candidates_rendezvous_and_ciphertext_relay() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 1).await;
+    let (b, bt) = reg(&app, 2).await;
+    let candidates = json!({"candidates":["127.0.0.1:1234","127.0.0.1:4321"]});
+    assert_eq!(
+        call(&app, "POST", "/v1/candidates", None, candidates.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    for who in [(a.as_str(), at.as_str()), (b.as_str(), bt.as_str())] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/candidates",
+                Some(who),
+                candidates.clone()
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let (code, peer) = call(
+        &app,
+        "POST",
+        "/v1/connect",
+        Some((&a, &at)),
+        json!({"public_key":b}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(peer["candidates"], candidates["candidates"]);
+    let packet = json!({"public_key":b,"packet":"01020304"});
+    assert_eq!(
+        call(&app, "POST", "/v1/relay", Some((&a, &at)), packet.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let (_, events) = call(&app, "GET", "/v1/events", Some((&b, &bt)), Value::Null).await;
+    assert_eq!(events["requests"][0]["public_key"], a);
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some((&b, &bt)),
+            json!({"public_key":a})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "POST", "/v1/relay", Some((&a, &bt)), packet.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, "POST", "/v1/relay", Some((&a, &at)), packet)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, events) = call(&app, "GET", "/v1/events", Some((&b, &bt)), Value::Null).await;
+    assert_eq!(events["packets"][0]["public_key"], a);
+    assert_eq!(events["packets"][0]["packet"], "01020304");
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/relay",
+            Some((&a, &at)),
+            json!({"public_key":b,"packet":"x"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn assigned_addresses_resolve_to_reciprocal_multi_peer_introductions() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let mut peers = Vec::new();
+    for n in 1..=3 {
+        let (k, t) = reg(&app, n).await;
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/candidates",
+                Some((&k, &t)),
+                json!({"candidates":["127.0.0.1:51820"]})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (code, info) = call(&app, "GET", "/v1/interface", Some((&k, &t)), Value::Null).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(info["virtual_ip"], format!("10.203.0.{n}"));
+        peers.push((k, t, info["virtual_ip"].clone()));
+    }
+    let (a, at, _) = &peers[0];
+    for (b, bt, ip) in &peers[1..] {
+        assert_eq!(
+            call(&app, "POST", "/v1/resolve", None, json!({"virtual_ip":ip}))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (code, p) = call(
+            &app,
+            "POST",
+            "/v1/resolve",
+            Some((a, at)),
+            json!({"virtual_ip":ip}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(p["public_key"], *b);
+        let (_, events) = call(&app, "GET", "/v1/events", Some((b, bt)), Value::Null).await;
+        assert_eq!(events["requests"][0]["public_key"], *a);
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/connect",
+                Some((b, bt)),
+                json!({"public_key":a})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    for (b, bt, _) in &peers[1..] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/relay",
+                Some((a, at)),
+                json!({"public_key":b,"packet":"01"})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (_, events) = call(&app, "GET", "/v1/events", Some((b, bt)), Value::Null).await;
+        assert_eq!(events["packets"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn read_only_binding_and_lookup_do_not_introduce_or_grant_relay() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 1).await;
+    let (b, bt) = reg(&app, 2).await;
+    for (k, t) in [(&a, &at), (&b, &bt)] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/candidates",
+                Some((k, t)),
+                json!({"candidates":["127.0.0.1:1234"]})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let (_, info) = call(&app, "GET", "/v1/interface", Some((&b, &bt)), Value::Null).await;
+    for (path, query) in [
+        ("/v1/lookup", json!({"virtual_ip":info["virtual_ip"]})),
+        ("/v1/binding", json!({"public_key":b})),
+    ] {
+        assert_eq!(
+            call(&app, "POST", path, None, query.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (code, p) = call(&app, "POST", path, Some((&a, &at)), query).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(p["public_key"], b);
+    }
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/binding",
+            Some((&b, &bt)),
+            json!({"public_key":a})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for (k, t) in [(&a, &at), (&b, &bt)] {
+        let (_, events) = call(&app, "GET", "/v1/events", Some((k, t)), Value::Null).await;
+        assert!(events["requests"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/relay",
+            Some((&a, &at)),
+            json!({"public_key":b,"packet":"01"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn rendezvous_sends_only_endpoints_and_never_grants_relay() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 1).await;
+    let (b, bt) = reg(&app, 2).await;
+    for (k, t) in [(&a, &at), (&b, &bt)] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/candidates",
+                Some((k, t)),
+                json!({"candidates":["127.0.0.1:1234"]})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let request = json!({"public_key":b});
+    assert_eq!(
+        call(&app, "POST", "/v1/rendezvous", None, request.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, "GET", "/v1/rendezvous", None, Value::Null)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/rendezvous",
+                Some((&a, &at)),
+                request.clone()
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let (code, hints) = call(&app, "GET", "/v1/rendezvous", Some((&b, &bt)), Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(hints.as_array().unwrap().len(), 1);
+    assert_eq!(hints[0].as_object().unwrap().len(), 2);
+    assert_eq!(hints[0]["candidates"], json!(["127.0.0.1:1234"]));
+    assert!(hints[0]["remaining_seconds"].as_u64().unwrap() <= 5);
+    let (_, hints) = call(&app, "GET", "/v1/rendezvous", Some((&b, &bt)), Value::Null).await;
+    assert_eq!(hints, json!([]));
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/relay",
+            Some((&a, &at)),
+            json!({"public_key":b,"packet":"01"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (_, events) = call(&app, "GET", "/v1/events", Some((&b, &bt)), Value::Null).await;
+    assert_eq!(events["requests"], json!([]));
+}
+
+#[tokio::test]
+async fn optional_rendezvous_binding_is_server_owned_and_does_not_grant_relay() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 1).await;
+    let (b, bt) = reg(&app, 2).await;
+    for (k, t) in [(&a, &at), (&b, &bt)] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/candidates",
+                Some((k, t)),
+                json!({"candidates":["127.0.0.1:1234"]})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    // The caller may request inclusion, but cannot provide the binding itself.
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/rendezvous",
+            Some((&a, &at)),
+            json!({"public_key":b,"include_binding":true,"binding":{"public_key":b}})
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/rendezvous",
+            Some((&a, &at)),
+            json!({"public_key":b,"include_binding":true})
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    call(
+        &app,
+        "POST",
+        "/v1/candidates",
+        Some((&a, &at)),
+        json!({"candidates":["127.0.0.1:2345"]}),
+    )
+    .await;
+    let (_, own) = call(&app, "GET", "/v1/interface", Some((&a, &at)), Value::Null).await;
+    let (_, hints) = call(&app, "GET", "/v1/rendezvous", Some((&b, &bt)), Value::Null).await;
+    assert_eq!(hints.as_array().unwrap().len(), 1);
+    let binding = &hints[0]["binding"];
+    assert_eq!(binding["public_key"], a);
+    assert_eq!(binding["virtual_ip"], own["virtual_ip"]);
+    assert_eq!(binding["candidates"], json!(["127.0.0.1:2345"]));
+    assert_eq!(binding["candidates"], hints[0]["candidates"]);
+    assert!(binding["remaining_seconds"].as_u64().unwrap() > 0);
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/relay",
+            Some((&a, &at)),
+            json!({"public_key":b,"packet":"01"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (_, events) = call(&app, "GET", "/v1/events", Some((&b, &bt)), Value::Null).await;
+    assert_eq!(events["requests"], json!([]));
+}

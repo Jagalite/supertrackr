@@ -1,4 +1,5 @@
 //! Async command handle. The spawned task exclusively owns the synchronous registry.
+use crate::core::traversal::{CandidatePeer, Events, InterfaceInfo, PunchHint};
 use crate::core::{Config, Credentials, Error, Key, PeerInfo, Registry, Result};
 use std::{
     io::Write,
@@ -26,6 +27,55 @@ enum Command {
         target: Key,
         endpoint: SocketAddr,
         reply: Reply<PeerInfo>,
+    },
+    Candidates {
+        who: Credentials,
+        candidates: Vec<SocketAddr>,
+        reply: Reply<()>,
+    },
+    Connect {
+        who: Credentials,
+        target: Key,
+        reply: Reply<CandidatePeer>,
+    },
+    Relay {
+        who: Credentials,
+        target: Key,
+        packet: Vec<u8>,
+        reply: Reply<()>,
+    },
+    Events {
+        who: Credentials,
+        reply: Reply<Events>,
+    },
+    Interface {
+        who: Credentials,
+        reply: Reply<InterfaceInfo>,
+    },
+    Resolve {
+        who: Credentials,
+        ip: std::net::Ipv4Addr,
+        reply: Reply<CandidatePeer>,
+    },
+    Lookup {
+        who: Credentials,
+        ip: std::net::Ipv4Addr,
+        reply: Reply<CandidatePeer>,
+    },
+    Binding {
+        who: Credentials,
+        target: Key,
+        reply: Reply<CandidatePeer>,
+    },
+    Rendezvous {
+        who: Credentials,
+        target: Key,
+        include_binding: bool,
+        reply: Reply<()>,
+    },
+    PunchHints {
+        who: Credentials,
+        reply: Reply<Vec<PunchHint>>,
     },
     Cleanup(Reply<()>),
     Len(Reply<usize>),
@@ -87,6 +137,64 @@ impl Coordinator {
         })
         .await
     }
+    pub async fn set_candidates(
+        &self,
+        who: Credentials,
+        candidates: Vec<SocketAddr>,
+    ) -> Result<()> {
+        self.call(|reply| Command::Candidates {
+            who,
+            candidates,
+            reply,
+        })
+        .await
+    }
+    pub async fn connect(&self, who: Credentials, target: Key) -> Result<CandidatePeer> {
+        self.call(|reply| Command::Connect { who, target, reply })
+            .await
+    }
+    pub async fn relay(&self, who: Credentials, target: Key, packet: Vec<u8>) -> Result<()> {
+        self.call(|reply| Command::Relay {
+            who,
+            target,
+            packet,
+            reply,
+        })
+        .await
+    }
+    pub async fn events(&self, who: Credentials) -> Result<Events> {
+        self.call(|reply| Command::Events { who, reply }).await
+    }
+    pub async fn interface(&self, who: Credentials) -> Result<InterfaceInfo> {
+        self.call(|reply| Command::Interface { who, reply }).await
+    }
+    pub async fn rendezvous(
+        &self,
+        who: Credentials,
+        target: Key,
+        include_binding: bool,
+    ) -> Result<()> {
+        self.call(|reply| Command::Rendezvous {
+            who,
+            target,
+            include_binding,
+            reply,
+        })
+        .await
+    }
+    pub async fn punch_hints(&self, who: Credentials) -> Result<Vec<PunchHint>> {
+        self.call(|reply| Command::PunchHints { who, reply }).await
+    }
+    pub async fn lookup(&self, who: Credentials, ip: std::net::Ipv4Addr) -> Result<CandidatePeer> {
+        self.call(|reply| Command::Lookup { who, ip, reply }).await
+    }
+    pub async fn binding(&self, who: Credentials, target: Key) -> Result<CandidatePeer> {
+        self.call(|reply| Command::Binding { who, target, reply })
+            .await
+    }
+    pub async fn resolve(&self, who: Credentials, ip: std::net::Ipv4Addr) -> Result<CandidatePeer> {
+        self.call(|reply| Command::Resolve { who, ip, reply }).await
+    }
     pub async fn cleanup(&self) -> Result<()> {
         self.call(Command::Cleanup).await
     }
@@ -136,6 +244,24 @@ async fn run(
                     Command::Verify { credentials, target, endpoint, reply } => {
                         if !reply.is_closed() { let _ = reply.send(registry.verify_peer(credentials, target, endpoint, now)); }
                     },
+                    Command::Candidates {who,candidates,reply} => {
+                        if !reply.is_closed() { let _ = reply.send(registry.set_candidates(who,candidates,now)); }
+                    },
+                    Command::Connect {who,target,reply} => {
+                        if !reply.is_closed() { let _ = reply.send(registry.connect(who,target,now)); }
+                    },
+                    Command::Relay {who,target,packet,reply} => {
+                        if !reply.is_closed() { let _ = reply.send(registry.relay(who,target,packet,now)); }
+                    },
+                    Command::Events {who,reply} => {
+                        if !reply.is_closed() { let _ = reply.send(registry.events(who,now)); }
+                    },
+                    Command::Rendezvous {who,target,include_binding,reply}=>{if !reply.is_closed(){let _=reply.send(registry.rendezvous_with_binding(who,target,include_binding,now));}},
+                    Command::PunchHints {who,reply}=>{if !reply.is_closed(){let _=reply.send(registry.punch_hints(who,now));}},
+                    Command::Lookup {who,ip,reply}=>{if !reply.is_closed(){let _=reply.send(registry.lookup(who,ip,now));}},
+                    Command::Binding {who,target,reply}=>{if !reply.is_closed(){let _=reply.send(registry.binding(who,target,now));}},
+                    Command::Interface {who,reply}=>{if !reply.is_closed(){let _=reply.send(registry.interface(who,now));}},
+                    Command::Resolve {who,ip,reply}=>{if !reply.is_closed(){let _=reply.send(registry.resolve(who,ip,now));}},
                     Command::Cleanup(reply) => {
                         if !reply.is_closed() { registry.cleanup(now); let _ = reply.send(Ok(())); }
                     },

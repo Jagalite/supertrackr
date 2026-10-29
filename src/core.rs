@@ -6,6 +6,8 @@ use crate::model::{
 use stateless::Model;
 use std::{collections::HashMap, net::SocketAddr};
 use subtle::ConstantTimeEq;
+#[path = "traversal.rs"]
+pub mod traversal;
 
 pub type Key = [u8; 32];
 pub type Result<T> = std::result::Result<T, Error>;
@@ -57,6 +59,7 @@ pub struct Registry {
     cursor: usize,
     cleanup_cursor: usize,
     config: Config,
+    traversal: traversal::Traversal,
 }
 fn decision(value: Decision) -> Result<u64> {
     match value {
@@ -76,6 +79,7 @@ impl Registry {
             cursor: 0,
             cleanup_cursor: 0,
             config,
+            traversal: traversal::Traversal::default(),
         }
     }
     fn authenticate(&self, credentials: Credentials, now: u64) -> Result<Lease> {
@@ -225,6 +229,16 @@ impl Registry {
         let before = self.records.len();
         self.records.retain(|_, r| valid(r.lease, now));
         if self.records.len() != before {
+            let removed: Vec<_> = self
+                .traversal
+                .peers
+                .keys()
+                .filter(|k| !self.records.contains_key(*k))
+                .copied()
+                .collect();
+            for key in removed {
+                self.traversal.remove(&key);
+            }
             self.discovery_keys
                 .retain(|key| self.records.contains_key(key));
             self.cleanup_cursor = 0;
@@ -241,9 +255,11 @@ impl Registry {
             self.cleanup_cursor %= self.discovery_keys.len();
             let key = self.discovery_keys[self.cleanup_cursor];
             if self.records.get(&key).is_some_and(|r| valid(r.lease, now)) {
+                self.traversal.maintain(&key, now);
                 self.cleanup_cursor += 1;
             } else {
                 self.records.remove(&key);
+                self.traversal.remove(&key);
                 self.discovery_keys.swap_remove(self.cleanup_cursor);
             }
         }

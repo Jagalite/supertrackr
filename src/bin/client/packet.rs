@@ -14,10 +14,14 @@ fn checksum(bytes: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
-pub fn encode(src: Ipv4Addr, dst: Ipv4Addr, kind: u8, nonce: u64) -> [u8; LEN] {
-    let mut out = [0u8; LEN];
+pub fn encode(src: Ipv4Addr, dst: Ipv4Addr, kind: u8, nonce: u64) -> Vec<u8> {
+    encode_sized(src, dst, kind, nonce, LEN)
+}
+pub fn encode_sized(src: Ipv4Addr, dst: Ipv4Addr, kind: u8, nonce: u64, len: usize) -> Vec<u8> {
+    assert!((LEN..=1400).contains(&len));
+    let mut out = vec![0u8; len];
     out[0] = 0x45;
-    out[2..4].copy_from_slice(&(LEN as u16).to_be_bytes());
+    out[2..4].copy_from_slice(&(len as u16).to_be_bytes());
     out[8] = 64;
     out[9] = 17;
     out[12..16].copy_from_slice(&src.octets());
@@ -26,16 +30,19 @@ pub fn encode(src: Ipv4Addr, dst: Ipv4Addr, kind: u8, nonce: u64) -> [u8; LEN] {
     out[10..12].copy_from_slice(&check.to_be_bytes());
     out[20..22].copy_from_slice(&PORT.to_be_bytes());
     out[22..24].copy_from_slice(&PORT.to_be_bytes());
-    out[24..26].copy_from_slice(&24u16.to_be_bytes()); // UDP checksum zero is valid for IPv4.
+    out[24..26].copy_from_slice(&((len - 20) as u16).to_be_bytes()); // UDP checksum zero is valid for IPv4.
     out[28..32].copy_from_slice(b"STR1");
     out[32] = kind;
     out[36..44].copy_from_slice(&nonce.to_be_bytes());
+    for (i, b) in out[44..].iter_mut().enumerate() {
+        *b = nonce.to_be_bytes()[i % 8];
+    }
     out
 }
 pub fn decode(bytes: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Option<(u8, u64)> {
-    if bytes.len() != LEN
+    if !(LEN..=1400).contains(&bytes.len())
         || bytes[0] != 0x45
-        || bytes[2..4] != (LEN as u16).to_be_bytes()
+        || bytes[2..4] != (bytes.len() as u16).to_be_bytes()
         || bytes[6..8] != [0, 0]
         || bytes[9] != 17
         || checksum(&bytes[..20]) != 0
@@ -43,10 +50,18 @@ pub fn decode(bytes: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Option<(u8, u64)> {
         || bytes[16..20] != dst.octets()
         || bytes[20..22] != PORT.to_be_bytes()
         || bytes[22..24] != PORT.to_be_bytes()
-        || bytes[24..28] != [0, 24, 0, 0]
+        || bytes[24..26] != ((bytes.len() - 20) as u16).to_be_bytes()
+        || bytes[26..28] != [0, 0]
         || &bytes[28..32] != b"STR1"
         || !(1..=2).contains(&bytes[32])
         || bytes[33..36] != [0, 0, 0]
+    {
+        return None;
+    }
+    if bytes[44..]
+        .iter()
+        .enumerate()
+        .any(|(i, b)| *b != bytes[36 + i % 8])
     {
         return None;
     }
@@ -66,6 +81,14 @@ mod tests {
         assert_eq!(decode(&p, a, b), Some((1, 42)));
         assert_eq!(decode(&p, b, a), None);
         assert_eq!(decode(&p[..43], a, b), None);
+        for len in [44, 1200, 1400] {
+            let mut large = encode_sized(a, b, 1, 42, len);
+            assert_eq!(decode(&large, a, b), Some((1, 42)));
+            if len > 44 {
+                large[44] ^= 1;
+                assert_eq!(decode(&large, a, b), None);
+            }
+        }
         p[8] ^= 1;
         assert_eq!(decode(&p, a, b), None);
     }

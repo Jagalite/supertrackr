@@ -6,7 +6,7 @@ ROOT=Path(__file__).resolve().parents[1]
 folder=ROOT/'bench/results'/time.strftime('client-%Y%m%d-%H%M%S')
 folder.mkdir(parents=True)
 manifest={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
-          for p in [ROOT/'Cargo.toml',ROOT/'Cargo.lock',*sorted((ROOT/'src').rglob('*.rs')),ROOT/'target/release/client',ROOT/'target/release/supertrackr']}
+          for p in [ROOT/'Cargo.toml',ROOT/'Cargo.lock',Path(__file__),*sorted((ROOT/'src').rglob('*.rs')),ROOT/'target/release/client',ROOT/'target/release/supertrackr']}
 (folder/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 processes=[]; files=[]
 def interrupted(signum, _frame):
@@ -51,6 +51,7 @@ try:
         for name,proc in clients.items():
             assert proc.wait(timeout=15)==0,(name,(folder/f'{name}.stderr').read_text())
             summary=await_event(name,'summary',proc);summaries[name]=summary
+            assert len([e for e in events(name) if e['event']=='peer_verified'])==1, 'live peer metadata lapsed and recreated the tunnel'
             assert summary['pongs_received']>=2 and summary['pings_received']>=2,summary
             assert summary['refreshes']>=2 and summary['rejected']>=1,summary
             assert (Path(keydir)/name).stat().st_mode & 0o777 == 0o600

@@ -4,6 +4,8 @@ A minimal Rust coordinator for on-demand WireGuard peer setup. Tokio/Axum serves
 HTTP(S); Statelessness models registration lifecycle and caller/peer access decisions. Runtime state is RAM-only. This is a new prototype, not the archived
 Go server.
 
+Requires Rust 1.91 or newer.
+
 ## Local run
 
 Build through the shared Rust queue:
@@ -38,9 +40,16 @@ are socket addresses such as `127.0.0.1:51820`.
 - `POST /v1/verify`: JSON with the incoming peer's `public_key` and `endpoint`.
   Returns `verified: true` plus the matched peer fields only if the exact binding
   is currently registered. Unknown/expired targets return 404; endpoint mismatch 409.
+- `POST /v1/candidates`: JSON `{"candidates":["127.0.0.1:51820"]}` replaces
+  the caller's list (1–8 unique addresses) and opts it into traversal.
+- `POST /v1/connect`: JSON `{"public_key":"…"}` selects a peer (up to 64 per caller), returns its
+  current key/candidates/lifetime, and requests reciprocal connection through the tracker.
+- `GET /v1/events`: consumes connection requests and queued relay packets.
+- `POST /v1/relay`: JSON `{"public_key":"…","packet":"<hex ciphertext>"}` queues
+  one WireGuard datagram, up to 2,048 bytes, only between mutually selected peers.
 - `GET /health`: process liveness only.
 
-Refresh, discovery and verification require `X-Peer-Key: <caller public key>` and
+Refresh, discovery, verification and all traversal operations require `X-Peer-Key: <caller public key>` and
 `Authorization: Bearer <session token>`. Initial registration requires
 `--open-registration`. Tokens are stored as SHA-256 digests and compared in constant
 time. Private WireGuard keys are never sent to this server.
@@ -69,7 +78,7 @@ cannot renew or verify a registration using an old enqueue timestamp.
 
 Storage is reserved up front for the configured capacity, trading startup allocation
 and reserved memory for avoiding growth reallocations during the initial fill.
-The default registration capacity is 100,000, request bodies are limited to 2 KiB,
+The default registration capacity is 100,000, request bodies are limited to 8 KiB,
 and discovery examines at most 4,096 records per command. The key index adds 32
 bytes per registration before vector spare capacity. Discovery is a bounded,
 rotating sample rather than complete pagination or uniform random selection.
@@ -84,7 +93,7 @@ owner after queued commands have been handled. Cancellation observed before
 execution skips a command; once an operation starts, it may commit even if its
 HTTP client disconnects. An unavailable owner returns HTTP 503.
 
-There are no pending brokering requests, per-peer inboxes, or poll endpoints.
+Traversal participants opt into bounded candidate lists, connection requests and relay inboxes.
 The old `/v1/peers/{key}`, `/v1/connect/{key}`, `/v1/pending`, and `/v1/self` routes
 are removed. Statelessness models the lease lifecycle and deterministic access
 decisions (caller eligibility, target expiry, self-query rejection and endpoint
@@ -92,9 +101,10 @@ matching). The registry supplies authentication facts; these models perform no
 I/O, crypto or locking. The registry itself performs constant-time token-hash
 comparisons. Complete runtime verification and capacity qualification remain open.
 
-This server does not implement the direct peer-introduction protocol, configure
-WireGuard, assign tunnel addresses, perform NAT traversal/relaying, or close an
-existing tunnel when a registration expires.
+The server assigns virtual addresses and verifies registrations. The companion
+implements direct peer introductions, configures WireGuard, and stops accepting
+traffic when its cached authorization expires. The server does not control OS
+interfaces or directly close remote tunnels.
 
 ## Tests and benchmarks
 
@@ -181,7 +191,7 @@ latency trace. Diagnostics are off unless the environment variable is present.
 
 `client` uses [BoringTun](https://github.com/cloudflare/boringtun), pinned to 0.7.1,
 for WireGuard handshakes and encrypted transport. It sends small IPv4/UDP ping/pong
-packets in-process over loopback UDP. It requires no root privileges and creates
+packets in-process over direct UDP or an HTTP ciphertext relay. Loopback is the default. It requires no root privileges and creates
 no OS tunnel interface or routes. This is a single-peer client lab, not general IP
 forwarding or BitTorrent integration.
 
@@ -222,3 +232,171 @@ the client; automatic reconnect is deferred. HTTP requires explicit loopback-onl
 `--lab-http`; HTTPS uses normal certificate validation but has not been exercised
 by this lab. Open registration still permits key squatting and does not itself
 prove possession of a private key; the WireGuard handshake provides that proof.
+
+## NAT and relay lab
+
+```sh
+# After rebuilding release binaries:
+python3 scripts/check_nat.py --scenario nat
+python3 scripts/check_nat.py --scenario relay
+```
+
+The NAT check starts two clients, one passive, and a userspace UDP NAT/filter
+simulator. It checks relay startup, coordinated direct hole punching, fallback
+after UDP loss, and recovery after a mapping change. These are real encrypted
+packets on loopback, not public-network or kernel-NAT qualification. The relay
+check disables direct UDP entirely. Receipts include source/binary hashes and
+per-client counters; temporary private keys are removed on exit.
+
+For a self-contained STUN lab, add `--stun-listen 127.0.0.1:3478` to the server
+and `--stun 127.0.0.1:3478` to both clients. The reflector reports the observed UDP
+source; on loopback that will match the socket's local address. It is optional
+and independent of the HTTP listener.
+
+For external testing, the client accepts `--allow-network --listen 0.0.0.0:51820`
+and `--stun <numeric-address>:3478`; use an HTTPS tracker. STUN runs on the same
+socket as WireGuard. You may supply up to two STUN servers and five explicit
+`--candidate <address>:<port>` values. Explicit candidates replace the host
+candidate; mapped candidates are then added. A wildcard bind needs a STUN server
+or explicit candidate to choose a local route. Each run uses one outer address
+family, while the test payload remains IPv4. No live external test is claimed.
+
+`--passive` waits for a tracker request instead of selecting a discovery result.
+`--relay-only` disables direct traffic for testing. Peer keys always come from the
+tracker; no peer-to-peer key introduction protocol is implemented.
+
+Optional router mapping (PCP/NAT-PMP/UPnP) uses the Rust `portmapper` library:
+
+```sh
+python3 /path/to/kyoto/kyoto.py submit -- cargo build --release --bin client --features router-mapping
+# Then add --portmap to an external IPv4 client command with --allow-network.
+```
+
+Router mapping is off by default and actual gateway acquisition/renewal/deletion
+has not been exercised. The feature adds dependencies only to enabled builds.
+Mapping addresses are published as hints; WireGuard authentication still validates
+peer traffic. Shutdown requests mapping removal, with lease expiry as fallback.
+
+The relay is a bounded HTTP polling prototype, not a throughput-qualified streaming
+service. Traversal is limited to 4,096 active participants and up to 64 selected peers
+per participant. Each recipient can queue 32 datagrams, with 4,096 datagrams
+(8 MiB maximum ciphertext payload) globally and ten-second message lifetimes.
+Eight connection requests per recipient are retained. Overflow returns 503 and
+client relay drops are counted. These bounds do not bound total process RAM or
+the existing unbounded coordinator command channel. See ARCHITECTURE.md for
+lifecycle, authorization and delivery semantics.
+
+To simulate larger traffic, use `scripts/check_nat.py --scenario direct` (or
+`relay` / `nat`) with `--packets-per-second 100 --packet-size 1200`. The requested
+application rate is emitted in 100 ms batches; small path probes are additional.
+Client summaries record generated requests, inner bytes, completed round trips,
+timeouts and pending requests at shutdown. There is no final drain period; pending
+requests are not classified as losses. A harness `passed` result means functional
+connectivity and accounting assertions passed, not lossless delivery or capacity.
+
+## Native macOS companion (prototype)
+
+`companion` manages multiple WireGuard peers behind one native `utun` interface.
+It discovers virtual destinations through the configured tracker, then exchanges
+public-key introductions directly between companions over UDP. The receiver checks
+registration with its configured tracker; WireGuard proves private-key possession. The server allocates addresses in `10.203.0.0/16`; only this subnet is
+routed into the interface. No default-route or DNS changes are made.
+
+Build through Kyoto:
+
+```sh
+python3 /path/to/kyoto/kyoto.py submit -- cargo build --bin companion --bin supertrackr
+```
+
+For a local tracker, start it normally:
+
+```sh
+./target/debug/supertrackr --lab-http --open-registration --listen 127.0.0.1:8443
+```
+
+Then launch the native companion from an administrator terminal:
+
+```sh
+sudo ./target/debug/companion --server http://127.0.0.1:8443/ \
+  --lab-http --key-file /var/root/supertrackr-companion.key
+```
+
+The ready record prints the assigned virtual IP and interface name. Applications
+connect to a remote peer's virtual IP and application port. For separate machines,
+use a trusted HTTPS tracker, `--allow-network`, a concrete `--listen LOCAL_IP:PORT`,
+and optionally up to two `--stun IP:PORT` reflectors. `--candidate IP:PORT` adds an
+explicit endpoint, and direct introductions use that same UDP socket. Default peer TTL is
+300 seconds. Ctrl-C closes the interface. A live registration currently prevents
+re-enrolling the same key until its lease has expired and cleanup runs.
+
+This is a root CLI, not a packaged macOS VPN app. The native adapter compiles but
+has **not been run with administrator privileges** in this session. Real TCP/UDP
+application acceptance through utun and route cleanup still need that test.
+IPv4 only, MTU 1280, at most 64 active peer sessions; overlay route conflicts are
+rejected. Tracker restarts invalidate registrations and require clearing application
+address caches before re-enrollment. BitTorrent announce integration is separate.
+
+Unprivileged integration checks (real WireGuard, synthetic inner IP packets):
+
+```sh
+python3 scripts/check_companion.py
+```
+
+These run three companion processes using owner-only Unix datagram adapters. The test proxy
+rejects the old key-introduction, event and relay endpoints while allowing
+endpoint-only rendezvous. Tests verify all
+six directed peer pairs with TCP-shaped and UDP payloads, not real TCP
+socket connections or native interface routing. Retries and drop counters are
+reported; a functional pass does not imply lossless forwarding or performance.
+
+The companion supports two introduction options, both using server-assisted NAT
+rendezvous and WireGuard, with no relay fallback. `/v1/rendezvous` queues short-lived endpoint
+hints so the target sends outbound UDP probes while the initiator attempts to
+connect. With the default `--introduction direct`, hints contain no public keys;
+companions exchange keys directly and verify them with the trusted tracker.
+With `--introduction server`, the notification also carries the sender's live,
+server-owned key/IP binding, letting the target install it and proceed directly
+to the WireGuard handshake. WireGuard still proves private-key possession.
+This flag selects the outbound preference; inbound connections support either
+option, so different preferences interoperate. No fallback is silently selected
+if a server-assisted rendezvous fails. STUN and
+probes use the same socket as WireGuard. Not every NAT/firewall permits a direct
+connection; UDP-blocked peers fail to connect without a relay.
+
+`/v1/lookup` and `/v1/binding` remain read-only discovery/verification endpoints.
+The server does not synchronize peer-key maps for this handshake. The old `client`
+lab retains its separate signaling/relay experiments.
+
+Test reciprocal punching with a userspace NAT/filter simulation and a negative
+control (neither test changes OS networking):
+
+```sh
+python3 scripts/check_companion.py --nat
+python3 scripts/check_companion.py --nat --introduction server
+python3 scripts/check_companion.py --nat --introduction mixed
+python3 scripts/check_companion.py --nat --disable-rendezvous
+```
+
+The negative control must remain disconnected. The simulator hides private
+same-host candidates and drops inbound traffic until the recipient has sent to
+the sender's mapped endpoint. These checks are not real-router or Internet NAT
+qualification. The companion polls rendezvous every 100 ms in this prototype.
+
+The [Tailscale connectivity audit](docs/CONNECTIVITY-AUDIT.md) records source-backed
+gaps and validation. The companion now uses nonce-correlated encrypted path probes,
+measured RTT with stable selection, and expiring path trust. Optional router mapping
+is available when built with `--features router-mapping` and explicitly launched
+with `--portmap --allow-network` on a non-loopback IPv4 address. Actual router mapping
+has not been tested here. `mapping_varies_by_destination` in the summary needs fresh
+STUN observations from distinct server IPs; null means insufficient evidence.
+
+Expanded simulated network checks:
+
+```sh
+python3 scripts/check_companion.py --nat --introduction mixed --recovery
+python3 scripts/check_companion.py --nat --nat-mode endpoint-dependent
+python3 scripts/check_companion.py --nat --nat-mode udp-blocked
+```
+
+The latter two must remain disconnected without relay. Recovery checks cover
+simulated UDP loss and public NAT rebinding, not actual OS interface changes.

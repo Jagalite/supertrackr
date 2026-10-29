@@ -1,6 +1,9 @@
 mod coordinator;
 pub mod core;
 pub mod model;
+mod path_selection;
+pub mod peer_manager;
+pub mod stun;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, State},
@@ -152,12 +155,156 @@ async fn verify_peer(
         peer: peer.into(),
     }))
 }
+pub use core::traversal::{CandidatePeer, Events, InterfaceInfo, PunchHint, RelayPacket};
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateRequest {
+    candidates: Vec<SocketAddr>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectRequest {
+    public_key: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayRequest {
+    public_key: String,
+    packet: String,
+}
+async fn candidates(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<CandidateRequest>,
+) -> Result<StatusCode> {
+    s.set_candidates(credentials(&headers)?, q.candidates)
+        .await
+        .map_err(status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn connect(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<ConnectRequest>,
+) -> Result<Json<CandidatePeer>> {
+    Ok(Json(
+        s.connect(credentials(&headers)?, parse_key(&q.public_key)?)
+            .await
+            .map_err(status)?,
+    ))
+}
+async fn relay(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<RelayRequest>,
+) -> Result<StatusCode> {
+    let who = credentials(&headers)?;
+    if q.packet.len() > core::traversal::MAX_DATAGRAM * 2 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let packet = hex::decode(q.packet).map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.relay(who, parse_key(&q.public_key)?, packet)
+        .await
+        .map_err(status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn events(State(s): State<Arc<Coordinator>>, headers: HeaderMap) -> Result<Json<Events>> {
+    Ok(Json(
+        s.events(credentials(&headers)?).await.map_err(status)?,
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveRequest {
+    virtual_ip: std::net::Ipv4Addr,
+}
+async fn interface(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+) -> Result<Json<InterfaceInfo>> {
+    Ok(Json(
+        s.interface(credentials(&headers)?).await.map_err(status)?,
+    ))
+}
+async fn resolve(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<ResolveRequest>,
+) -> Result<Json<CandidatePeer>> {
+    Ok(Json(
+        s.resolve(credentials(&headers)?, q.virtual_ip)
+            .await
+            .map_err(status)?,
+    ))
+}
+async fn lookup(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<ResolveRequest>,
+) -> Result<Json<CandidatePeer>> {
+    Ok(Json(
+        s.lookup(credentials(&headers)?, q.virtual_ip)
+            .await
+            .map_err(status)?,
+    ))
+}
+async fn binding(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<ConnectRequest>,
+) -> Result<Json<CandidatePeer>> {
+    Ok(Json(
+        s.binding(credentials(&headers)?, parse_key(&q.public_key)?)
+            .await
+            .map_err(status)?,
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RendezvousRequest {
+    public_key: String,
+    #[serde(default)]
+    include_binding: bool,
+}
+async fn rendezvous(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<RendezvousRequest>,
+) -> Result<StatusCode> {
+    s.rendezvous(
+        credentials(&headers)?,
+        parse_key(&q.public_key)?,
+        q.include_binding,
+    )
+    .await
+    .map_err(status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn punch_hints(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PunchHint>>> {
+    Ok(Json(
+        s.punch_hints(credentials(&headers)?)
+            .await
+            .map_err(status)?,
+    ))
+}
 pub fn router(s: Arc<Coordinator>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/register", post(register))
         .route("/v1/peers", get(get_peers))
         .route("/v1/verify", post(verify_peer))
-        .layer(DefaultBodyLimit::max(2048))
+        .route("/v1/candidates", post(candidates))
+        .route("/v1/connect", post(connect))
+        .route("/v1/events", get(events))
+        .route("/v1/relay", post(relay))
+        .route("/v1/interface", get(interface))
+        .route("/v1/resolve", post(resolve))
+        .route("/v1/lookup", post(lookup))
+        .route("/v1/binding", post(binding))
+        .route("/v1/rendezvous", post(rendezvous).get(punch_hints))
+        .layer(DefaultBodyLimit::max(8192))
         .with_state(s)
 }

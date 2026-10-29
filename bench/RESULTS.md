@@ -356,3 +356,211 @@ performance. The lab configures one peer and manually supplied inner IPv4
 addresses; session tokens are RAM-only, reconnect is deferred, and open
 registration still permits public-key squatting. No server protocol or registry
 implementation change was needed.
+
+## 2026-10-28: NAT traversal and ciphertext relay prototype
+
+Functional qualification only; no throughput, Internet NAT, or router-mapping
+capacity claim. Final release receipts (source and binary hashes rechecked):
+
+- `bench/results/client-20261028-182926/summary.json`: direct loopback, 12
+  authenticated round trips per client, five refreshes each, injected garbage rejected.
+- `bench/results/traversal-nat-20261028-182926/summary.json`: two client processes,
+  one passive, using a userspace NAT/filter simulator. Clients completed 29 and 30 round
+  trips and ten refreshes. Assertions passed for startup relay (UDP blocked),
+  coordinated direct hole punching, relay fallback after path loss, and direct
+  recovery after a mapped-port change. Six STUN replies, 82 forwarded packets,
+  33 deliberately blocked packets, five filtering drops, one rebind; one client
+  relay admission/queue drop was recorded. Rejected WireGuard packets are retained
+  in client counters (including duplicate/replay traffic during path races).
+- `bench/results/traversal-relay-20261028-182926/summary.json`: forced relay-only,
+  eight authenticated round trips per client, three refreshes each, zero direct
+  packets sent and zero direct paths validated. No relay queue/admission drops.
+
+29 default-feature Rust tests executed and passed (16 library/model/core/STUN,
+six client, seven HTTP API). Coverage includes mutual relay selection, invalid
+credentials, source-session replacement, expiry, candidate replacement, per-peer
+and global relay capacity, STUN transaction/source/length/IPv4/IPv6/fingerprint
+checks, an actual UDP STUN reflector, and existing WireGuard key/tamper/replay tests.
+The optional router-mapping build also compiled and its 28 then-current tests
+passed before the final common fingerprint test was added. Router-mapping code
+was checked again by the final all-target/all-feature Clippy run with warnings
+denied. Gateway discovery and actual mapping acquisition/renewal/removal were not
+executed; no router settings were changed by the checks.
+
+Final Kyoto jobs: default test compilation `19604ba0895149a8868904a47e21135e`,
+all-feature Clippy `b66cf3f5b9e24dee836a84f6ba2e7b73`, release binaries
+`60cb7f22b3e04bb284a59e879d7724f0`. Test binaries were executed explicitly after
+Kyoto's compilation-only policy. Formatting and diff checks passed. The optional
+`portmapper` dependency raises the declared Rust minimum to 1.91; this session used
+the installed compiler, not a separate minimum-version toolchain qualification.
+
+Final review found an avoidable short-lease tunnel reset with one-second peer
+metadata polling. The final client uses 500 ms polling; the repeated direct lab
+now asserts exactly one tunnel creation per client across five lease refreshes.
+This last cadence change was checked by the final release integration runs and
+all-feature Clippy after the 29-test run above.
+
+## 2026-10-28: encrypted traffic simulation
+
+Release client workload: 100 requested application packets/s per client, 1,200-byte
+inner IPv4 packets, plus small path probes. Real WireGuard traffic between two
+processes on this Mac. No final drain; pending requests remain separate from
+five-second timeouts. Tests ran concurrently and do not establish capacity.
+
+Receipts `traversal-{direct,relay,nat}-20261028-221051`:
+
+| Scenario | Duration | Generated | Completed round trips | Timed out | Pending at exit | Relay drops |
+|---|---:|---:|---:|---:|---:|---:|
+| Direct | 8 s | 1,578 | 1,578 | 0 | 0 | 0 |
+| Relay-only | 8 s | 1,490 | 1,421 | 39 | 30 | 39 |
+| Simulated NAT/outages/rebind | 27 s | 5,444 | 4,345 | 1,073 | 26 | 42 |
+
+Counts sum both clients; generated = completed + timed out + pending. Relay-drop
+counts are datagram queue/admission failures and are not additional round-trip
+losses. The NAT fixture deliberately blocked 2,251 datagrams and filtered 233.
+All functional transition and accounting assertions passed; relay traffic was
+not lossless. This identifies a limitation of the current polling relay without
+measuring its isolated throughput ceiling. Six client tests (including variable
+payload validation, encryption/tamper/replay) and client Clippy passed. Final
+release build: Kyoto `e9ade179fc8042d38baafdcbb7567fdf`.
+
+## Native companion integration — 2026-10-29
+
+Debug macOS build, three companion processes plus a local tracker. Receipts:
+`bench/results/companion-20261029/{tests.txt,direct.json,relay.json}`.
+These are functional raw-IP Unix datagram adapter checks, **not utun, real TCP
+socket, throughput, or capacity qualification**. Six directed peer pairs each
+carry TCP-shaped and UDP payloads; the harness retries until each expected packet
+arrives and separately verifies the authenticated delivery path counters.
+
+- 35 Rust tests executed and passed, including multi-peer WireGuard decryption,
+  forged inner-source rejection, address non-reuse/exhaustion, route conflicts,
+  and HTTP virtual-address resolution/reciprocal introductions.
+- Direct: 12 checks passed, 12 test packets offered, 12 direct inner deliveries;
+  three I/O/relay drop events and four rejected inputs (including the intentional
+  source-spoof test). No pending-resolution queue drops.
+- Forced relay: 12 checks passed, 49 test packets offered with retries, 49 relay
+  inner deliveries; three I/O/relay drop events and nine rejected inputs. No
+  pending-resolution queue drops. This is not a lossless/capacity claim; counters
+  include control-path WireGuard traffic and duplicate/replayed inputs.
+- All-target/all-feature Clippy with warnings denied passed.
+- Native adapter's non-root startup correctly refused before registration or
+  route changes. `sudo -n true` reported a password was required. Privileged
+  interface creation, real application TCP/UDP and route cleanup were not run.
+
+## Direct peer introductions — 2026-10-29
+
+This supersedes the companion's earlier server-introduction/forced-relay workflow;
+the old packet lab and its historical receipts remain separate.
+
+39 Rust tests executed successfully after Kyoto compile-only job
+`599044c8719c46e38b2d6b421ee59164`. All-target/all-feature Clippy with warnings denied
+passed in job `a4537522949c4a5091fd4da58af81cd6`.
+
+`python3 scripts/check_companion.py` ran three companion processes with a proxy
+that rejects `/v1/connect`, `/v1/resolve`, `/v1/events` and `/v1/relay`. It passed
+12 directed protocol checks (six peer pairs, TCP-shaped and UDP payloads), with
+12 packets offered and 12 direct encrypted inner deliveries. Each companion
+completed two direct introductions. No introduction rejection, I/O drop or
+pending-resolution drop occurred. One intentionally forged inner source was
+rejected. The HTTP counts were exactly three each for registration, candidate
+publication, own-interface metadata, read-only destination lookup and read-only
+binding verification; zero calls to the four forbidden signaling/relay routes.
+
+Unit/API checks cover challenge-before-verification, duplicate suppression,
+wrong authority/source, expired challenges and late verification, pending/rate
+bounds, and read-only lookup/verification leaving both introduction inboxes and
+reciprocal relay permissions untouched. These are prototype functional results,
+not production DoS, NAT reachability, throughput or privileged utun qualification.
+
+## Endpoint-only NAT rendezvous, no companion relay — 2026-10-29
+
+Added server-assisted reciprocal UDP attempts while retaining direct public-key
+introductions. The companion still makes zero calls to legacy `/v1/connect`,
+`/v1/resolve`, `/v1/events`, and `/v1/relay`; the integration proxy rejects those
+routes. `/v1/rendezvous` carries candidate addresses and a short lifetime only.
+
+42 Rust tests passed after Kyoto compile-only job
+`8d0526aea1c74ba09ae3f4183162266c`; all-target/all-feature Clippy with warnings denied
+passed in `eafda0b471bf470fba2ae48db84b6cee`. Unit/API coverage includes authentication,
+deduplication, queue/rate limits, expiry, stale registration rejection, endpoint-only
+responses, and absence of key-introduction or relay grants. Test logs plus direct
+and negative-control receipts: `bench/results/rendezvous-20261029/`.
+
+Three real companion processes, synthetic inner TCP-shaped/UDP packets, loopback
+userspace NAT with endpoint-independent mappings and endpoint-dependent filtering:
+
+- Rendezvous enabled (`--nat`): 12 directed protocol checks passed. 15 test packets
+  offered and 15 direct inner deliveries, six completed introduction sides,
+  three endpoint hints, 14 outbound punch probes. The NAT fabric recorded three
+  STUN exchanges, 68 forwarded datagrams (42 WireGuard), and three filter drops.
+  No companion I/O, punch, or pending-resolution queue drops; one intentionally
+  forged inner source was rejected. No relay deliveries.
+- Rendezvous suppressed (`--nat --disable-rendezvous`): expected disconnection
+  confirmed. Zero introductions, WireGuard forwarding or inner deliveries; 11
+  NAT filter drops. 18 test packets offered and 16 pending-resolution drops;
+  remaining buffered work at shutdown is not separately reported. This is a
+  negative reachability check, not a loss/capacity measurement.
+- Plain loopback: all 12 directed checks passed with 12 offered/direct deliveries.
+
+The simulator removes private same-host candidate addresses from advertisements,
+preventing a direct loopback bypass. These results establish the rendezvous
+mechanism for this modeled filter, not general Internet/router NAT compatibility,
+production load, or privileged macOS utun application acceptance.
+
+## Both introduction options — 2026-10-29
+
+`--introduction direct` remains the default. `--introduction server` requests a
+current server-owned key/IP binding with rendezvous, bypassing the separate UDP
+key-introduction exchange. Receivers accept either option. Neither creates relay
+permission or enables data relay.
+
+43 Rust tests passed. Initial API coverage expected HTTP 400 for a forbidden
+caller-supplied binding; Axum correctly rejected that JSON with 422. The assertion
+was corrected and all 11 API tests then passed. Compile jobs:
+`4a2b994464324a2baea792fa0e175429`, then `cd9f051aa0c64ec7843ff5951a2d5eda` for the
+corrected API test. All-target/all-feature Clippy with warnings denied passed in
+`07752dbcd5e84b1086e1d082f71dd919`.
+
+Three-companion NAT simulation passed all 12 directed TCP-shaped/UDP packet checks
+in direct, server-assisted and mixed preference configurations. Server mode used
+zero direct introduction exchanges and received six tracker bindings across the
+three companions; mixed mode exercised two direct introduction sides and four
+tracker bindings. All three runs made zero legacy key-introduction/event/relay
+calls, delivered no relay traffic, and reported zero I/O, punch or resolution
+queue drops. One intentional forged-source input was rejected in each run.
+
+These are bounded functional packet-adapter tests, not real TCP socket, privileged
+utun, physical-router, production DoS or performance qualification. Direct/mixed
+receipts and test output are in `bench/results/introduction-modes-20261029/`.
+
+## Tailscale source audit and path validation — 2026-10-29
+
+Reference source pinned to `tailscale/tailscale` commit
+`f7c1b8e52600c1926623b29c91972a5ea1364d2f`; findings and remaining gaps are recorded in
+`docs/CONNECTIVITY-AUDIT.md`. This is not an equivalence or performance claim.
+
+47 Rust tests passed after compile-only job `82463b09e06241ccb7210c272d30ef65`.
+All-target/all-feature Clippy passed in `f7992ebd9c7c405d88cb803f0a12e190` following
+a style-only nested-if correction. Added coverage includes nonce/endpoint/time
+correlation, replay rejection, path trust expiry, RTT hysteresis, bounded learned
+endpoints, fresh STUN mapping classification and disabled router-mapping behavior.
+Real router mapping acquisition/renewal/removal remains untested.
+
+The mixed-introduction userspace NAT run passed all 12 initial directed packet
+checks and two recovery checks (temporary UDP outage and replacement of all public
+NAT mappings). It recorded 13 validated encrypted Pongs, seven path selections,
+24 deliberately blocked datagrams and four filter drops. No relay calls/deliveries
+occurred. Recovery packet offers were not counted separately in that initial
+receipt; the harness now reports them separately. This was a reachability check,
+not loss-rate or throughput qualification.
+
+Endpoint-dependent mappings plus endpoint-dependent filtering correctly stayed
+blocked (32 filter drops, zero forwarded WireGuard or inner deliveries). The
+peer-UDP-blocked model likewise stayed blocked (31 blocked datagrams, zero
+WireGuard/inner deliveries). Both allowed STUN and HTTP rendezvous; one STUN
+server is insufficient to classify mapping variation, so diagnostics remained
+unknown. Neither negative outcome is a claim about every real NAT of that class.
+
+Receipts: `bench/results/tailscale-audit-20261029/`. All traffic used raw-IP test
+adapters, not a privileged macOS interface or real TCP application sockets.
