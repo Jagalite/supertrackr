@@ -650,3 +650,99 @@ acceptance is capacity-blocked, and transfers that data after freeing one slot.
 Clippy job `e9962fd74ad34987a6a8de2e11e8070d` subsequently succeeded (exit 0)
 for the library and both userspace test targets with warnings denied. Kyoto's
 normal scheduling was preserved while the checks remained queued.
+
+## Optional BitTorrent library and overlay API — 2026-10-29
+
+Added the dependency-free `supertrackr-bittorrent` workspace crate and optional
+`bittorrent` server feature. Membership updates execute in the coordinator owner
+task after authentication, using the authenticated identity and lease deadline.
+The API supports announce, stopped and scrape events for v1 and full v2 hashes.
+This is an overlay JSON API, not a standard HTTP/UDP BitTorrent tracker endpoint.
+
+Kyoto compilation `dbf4d4ad15e04e76adcc0775f64ff228` succeeded. All emitted test
+binaries were executed: 67 tests passed, including authenticated swarm discovery,
+spoofed-credential rejection, malformed input, stop, hash isolation and lease-bound
+expiry. Default-feature-disabled library compilation passed in
+`4176047b4e4e430c941f194a0e7570b1`. Formatting and diff checks passed.
+Clippy `a38943760c584185b99cb7e33a744c6c` passed across the workspace and all
+targets with the BitTorrent feature and warnings denied, after Kyoto retried a
+host-memory-pressure interruption. No performance or Internet NAT qualification
+is implied.
+
+## Companion selectable exits — 2026-10-29
+
+Added overlay-only (default), local IPv4 TCP/UDP exit and explicitly pinned remote
+WireGuard gateway modes. Gateway forwarding requires an explicit peer-key allowlist;
+expired bindings remove gateway flow engines. Remote mode never creates a local
+exit engine. Scoped native default routing and MTU 1200 are requested only when
+an exit mode is selected; the host unscoped default is unchanged.
+
+Workspace compilation `32b4ed25029444508c32fe49fab2791d` succeeded and all emitted
+binaries executed: 71 tests passed. New tests include 32 KiB real TCP echo with
+half-close, connected UDP flow isolation/expiry, packet validation, and a real
+WireGuard-encrypted gateway UDP round trip with authorization/fail-closed checks.
+After queue-bound and delivery-timeout fixes, final focused compilation
+`33c90a0845d84f7bb0b7170fa169aeb6` succeeded and its 29 library plus 8 companion
+tests executed successfully. Initial Clippy attempts found two collapsible-if
+style issues; both were fixed. Final workspace/all-target Clippy with BitTorrent
+and warnings denied passed in `8fe24ac6d2ec45c489374b640edb263c`.
+Formatting and diff checks passed.
+
+Native macOS interface routing and application binding remain UNVERIFIED:
+`sudo -n true` reported that a password is required. No privileged host-route test
+was performed. This is functional packet/socket evidence, not native-interface,
+Internet NAT, throughput, IPv6 or general-purpose VPN qualification. See
+`docs/EXIT-MODES.md` for forwarding and DNS limitations.
+
+## IPv6 exits and explicit inbound mappings — 2026-10-29
+
+Extended the exit engine to IPv4/IPv6 TCP/UDP with IPv6 transport checksums and
+1280-byte inner MTU. Gateway envelopes permit 1304 bytes without raising ordinary
+overlay packet limits. Added explicit local and authorized per-client gateway
+TCP/UDP listeners, per-flow replies, same-port separate-family listeners,
+proactive binding lookup/retry and lease-bound listener cleanup. Native IPv6
+addresses derive from the authenticated IPv4 identity under fdcb::/96.
+
+Initial check `eb41af03f77142278cd7bdcf5bef8acd` caught two IPv4-only exhaustive
+patterns after enabling smoltcp IPv6; these now explicitly reject IPv6 in the
+separate IPv4 overlay API. Check `d1609704e684461ea3a66a414983258f` passed.
+Focused compilation `4f6e8f6ad0424f2a8760777020089cb3` passed and its emitted
+binaries executed: 32 library plus 9 companion tests passed. Coverage includes
+IPv4/IPv6 inbound TCP/UDP, half-close, IPv6 checksums/full-MTU envelopes, encrypted
+gateway round trips and authorized listener expiry.
+
+The final listener change sets IPV6_V6ONLY before bind and adds a same-port
+separate-family test. A concurrent earlier Clippy run observed the source change
+before the new direct socket2 dependency was in its loaded build graph; it failed
+and is not passing evidence. Final workspace compilation
+`4b9bbaad789d44a085607aa55052aea4` and workspace/all-target Clippy with BitTorrent
+and warnings denied `d3cfffd9cc2a47e3812ad58b71bf1fc5` both passed.
+
+Final workspace test execution completed after a macOS loader delay: all 76 tests
+passed (33 library, 6 client, 9 companion, 13 API, 9 async userspace, 4 userspace,
+2 BitTorrent library). During the delay, a sample showed the first binary at
+`_dyld_start` before test startup; the original run was preserved and completed.
+Formatting and whitespace checks passed. Native privileged utun IPv6 routing,
+real-client binding and external Internet inbound reachability remain unverified;
+no host router/NAT/firewall changes were performed.
+
+## Review fixes: mapped UDP and interface backpressure — 2026-10-29
+
+Outbound-first UDP now selects the configured mapping matching the application's
+port and address family instead of allocating an ephemeral socket. IPv4/IPv6
+regressions verify the observed external source port and subsequent replies.
+
+Interface writes now run as a separate event-loop branch against a bounded
+128-packet queue. Packets expire after at most 20 ms, capped by local/remote lease
+deadlines; deadline readiness takes precedence over writes. Overflow is dropped.
+Peer-manager timer/send operations use fresh timestamps after exit polling.
+The regression covers overflow, other-event progress with a blocked writer,
+cancellation preserving the queue and expiry without invoking the writer.
+
+Kyoto workspace test compilation `62ee01735623449b97736b9ef44b9c61` passed. Final
+companion compilation after tightening deadline precedence used
+`eb51e0f53ade4c2c828e1b2b11bbefd1`; all emitted workspace binaries (including that
+final companion artifact) then executed: 78 tests passed. Workspace/all-target
+Clippy with BitTorrent and warnings denied passed in
+`17ed4d48cc4c4dce97474559897a249a`. Formatting and diff checks passed. Native
+privileged interface routing remains unverified.

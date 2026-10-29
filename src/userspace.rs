@@ -252,7 +252,12 @@ impl Network {
         let remote = socket
             .remote_endpoint()
             .ok_or_else(|| error(io::ErrorKind::NotConnected, "missing remote endpoint"))?;
-        let IpAddress::Ipv4(ip) = remote.addr;
+        let IpAddress::Ipv4(ip) = remote.addr else {
+            return Err(error(
+                io::ErrorKind::InvalidData,
+                "IPv6 overlay stream unsupported",
+            ));
+        };
         self.room()?;
         let mut replacement = Self::tcp_socket();
         replacement
@@ -364,7 +369,12 @@ impl Network {
         let (n, meta) = s
             .recv_slice(data)
             .map_err(|_| error(io::ErrorKind::InvalidInput, "UDP receive buffer too short"))?;
-        let IpAddress::Ipv4(ip) = meta.endpoint.addr;
+        let IpAddress::Ipv4(ip) = meta.endpoint.addr else {
+            return Err(error(
+                io::ErrorKind::InvalidData,
+                "IPv6 overlay datagram unsupported",
+            ));
+        };
         Ok((n, SocketAddrV4::new(ip, meta.endpoint.port)))
     }
     pub fn remove_udp(&mut self, id: UdpId) -> io::Result<()> {

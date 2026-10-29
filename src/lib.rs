@@ -1,7 +1,10 @@
 pub mod async_userspace;
+#[cfg(feature = "bittorrent")]
+mod bittorrent;
 mod coordinator;
 pub mod core;
 pub mod enrollment;
+pub mod exit;
 pub mod model;
 mod path_selection;
 pub mod peer_manager;
@@ -323,7 +326,7 @@ async fn punch_hints(
     ))
 }
 pub fn router(s: Arc<Coordinator>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/register", post(register))
         .route("/v1/register/challenge", post(challenge))
@@ -337,7 +340,8 @@ pub fn router(s: Arc<Coordinator>) -> Router {
         .route("/v1/resolve", post(resolve))
         .route("/v1/lookup", post(lookup))
         .route("/v1/binding", post(binding))
-        .route("/v1/rendezvous", post(rendezvous).get(punch_hints))
-        .layer(DefaultBodyLimit::max(8192))
-        .with_state(s)
+        .route("/v1/rendezvous", post(rendezvous).get(punch_hints));
+    #[cfg(feature = "bittorrent")]
+    let router = router.merge(bittorrent::routes());
+    router.layer(DefaultBodyLimit::max(8192)).with_state(s)
 }

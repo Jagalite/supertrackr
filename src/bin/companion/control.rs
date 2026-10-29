@@ -3,6 +3,7 @@ use serde_json::json;
 use supertrackr::{CandidatePeer, InterfaceInfo, PunchHint, RegistrationResponse};
 use tokio::sync::{mpsc, watch};
 pub enum Request {
+    Peer(String),
     Resolve(Ipv4Addr),
     Verify(introduction::Ticket),
     Track(String, Instant),
@@ -123,6 +124,7 @@ impl Control {
     ) -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pinned = std::collections::HashSet::new();
         let mut peers = std::collections::HashMap::<String, Instant>::new();
         fn next(until: Instant) -> Instant {
             let now = Instant::now();
@@ -149,11 +151,20 @@ impl Control {
                     let due=peers.iter().filter(|(_,at)|**at<=Instant::now()).min_by_key(|(_,at)|**at).map(|(k,_)|k.clone());
                     if let Some(key)=due {
                         if let Some((p,until))=self.connect("v1/binding",json!({"public_key":key})).await? {
+                            if pinned.contains(&key) {let _=self.auth(self.http.post(self.base.join("v1/rendezvous")?)).json(&json!({"public_key":key,"include_binding":true})).send().await?;}
                             peers.insert(key,next(until));events.send(Event::Refreshed(p,until)).await?;
-                        }else{peers.remove(&key);}
+                        }else if pinned.contains(&key){peers.insert(key,Instant::now()+Duration::from_secs(2));}else{peers.remove(&key);}
                     }
                 },
                 request=requests.recv()=>match request.ok_or("request channel closed")? {
+                    Request::Peer(key)=>{
+                        if pinned.len()>=9 && !pinned.contains(&key){continue;}pinned.insert(key.clone());
+                        if let Some((p,until))=self.connect("v1/binding",json!({"public_key":key})).await? {
+                            let _=self.auth(self.http.post(self.base.join("v1/rendezvous")?)).json(&json!({"public_key":p.public_key,"include_binding":true})).send().await?;
+                            peers.insert(p.public_key.clone(),next(until));
+                            events.send(Event::Refreshed(p,until)).await?;
+                        } else { peers.insert(key,Instant::now()+Duration::from_secs(2)); }
+                    },
                     Request::Resolve(ip)=>{
                         if peers.len()>=64 {continue;}
                         if let Some((p,until))=self.connect("v1/lookup",json!({"virtual_ip":ip})).await? {

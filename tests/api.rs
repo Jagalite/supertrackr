@@ -1027,3 +1027,108 @@ async fn anonymous_enrollment_requires_scoped_proof_and_never_overwrites() {
     );
     assert_eq!(state.len().await.unwrap(), 1);
 }
+
+#[cfg(feature = "bittorrent")]
+#[tokio::test]
+async fn overlay_swarm_announce_discovery_and_stop() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 9001).await;
+    let (b, bt) = reg(&app, 9002).await;
+    for (key, token) in [(&a, &at), (&b, &bt)] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/candidates",
+                Some((key, token)),
+                json!({"candidates":["127.0.0.1:51820"]})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let hash = "01".repeat(20);
+    let announce = json!({"event":"announce","info_hash":hash,"port":6881,"complete":true});
+    assert_eq!(
+        call(&app, "POST", "/v1/bittorrent", None, announce.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (code, first) = call(
+        &app,
+        "POST",
+        "/v1/bittorrent",
+        Some((&a, &at)),
+        announce.clone(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(first["seeders"], 1);
+    assert_eq!(first["peers"], json!([]));
+    let (code, peers) = call(
+        &app,
+        "POST",
+        "/v1/bittorrent",
+        Some((&b, &bt)),
+        json!({"event":"announce","info_hash":hash,"port":6882,"complete":false}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(peers["seeders"], 1);
+    assert_eq!(peers["leechers"], 1);
+    assert_eq!(peers["peers"][0]["public_key"], a);
+    assert_eq!(peers["peers"][0]["port"], 6881);
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/bittorrent",
+            Some((&a, &bt)),
+            announce.clone()
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let mut invalid = announce.clone();
+    invalid["port"] = json!(0);
+    assert_eq!(
+        call(&app, "POST", "/v1/bittorrent", Some((&a, &at)), invalid)
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let mut invalid = announce.clone();
+    invalid["info_hash"] = json!("zz".repeat(20));
+    assert_eq!(
+        call(&app, "POST", "/v1/bittorrent", Some((&a, &at)), invalid)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, stopped) = call(
+        &app,
+        "POST",
+        "/v1/bittorrent",
+        Some((&a, &at)),
+        json!({"event":"stopped","info_hash":hash}),
+    )
+    .await;
+    assert_eq!(stopped["seeders"], 0);
+    assert_eq!(stopped["leechers"], 1);
+    let (_, scrape) = call(
+        &app,
+        "POST",
+        "/v1/bittorrent",
+        Some((&b, &bt)),
+        json!({"event":"scrape","info_hash":"01".repeat(32)}),
+    )
+    .await;
+    assert_eq!(scrape["seeders"], 0);
+    assert_eq!(scrape["leechers"], 0);
+}

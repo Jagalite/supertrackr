@@ -61,7 +61,15 @@ fn checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 pub fn addresses(p: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
-    if p.len() < 20 || p.len() > MTU || p[0] >> 4 != 4 {
+    if p.len() < 20
+        || p[0] >> 4 != 4
+        || (p.len() > MTU
+            && !(p.len() <= crate::exit::MTU + 24
+                && p.len() >= 24
+                && p[0] == 0x45
+                && p[9] == 252
+                && &p[20..23] == b"EX1"))
+    {
         return None;
     }
     let header = usize::from(p[0] & 15) * 4;
@@ -231,6 +239,13 @@ impl Manager {
             }
         }
         Ok(out)
+    }
+    /// Current authenticated deadline for queued application delivery.
+    pub fn peer_deadline(&self, ip: Ipv4Addr) -> Option<Instant> {
+        self.peers
+            .values()
+            .find(|peer| peer.binding.virtual_ip == ip)
+            .map(|peer| peer.until)
     }
     pub fn send(&mut self, packet: Vec<u8>, now: Instant) -> Vec<Effect> {
         let Some((src, dst)) = addresses(&packet) else {

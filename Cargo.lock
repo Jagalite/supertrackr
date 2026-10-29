@@ -2646,15 +2646,21 @@ dependencies = [
  "serde_json",
  "sha2",
  "smoltcp",
+ "socket2",
  "statelessness",
  "statelessness-debug",
  "subtle",
+ "supertrackr-bittorrent",
  "tempfile",
  "tokio",
  "tower",
  "tun",
  "zeroize",
 ]
+
+[[package]]
+name = "supertrackr-bittorrent"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

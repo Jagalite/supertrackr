@@ -10,6 +10,12 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 type Reply<T> = oneshot::Sender<Result<T>>;
 enum Command {
+    #[cfg(feature = "bittorrent")]
+    Torrent {
+        who: Credentials,
+        request: crate::bittorrent::Request,
+        reply: Reply<crate::bittorrent::Response>,
+    },
     Register {
         key: Key,
         endpoint: SocketAddr,
@@ -118,6 +124,19 @@ impl Coordinator {
             .send(command(reply))
             .map_err(|_| Error::Unavailable)?;
         response.await.map_err(|_| Error::Unavailable)?
+    }
+    #[cfg(feature = "bittorrent")]
+    pub(crate) async fn torrent(
+        &self,
+        who: Credentials,
+        request: crate::bittorrent::Request,
+    ) -> Result<crate::bittorrent::Response> {
+        self.call(|reply| Command::Torrent {
+            who,
+            request,
+            reply,
+        })
+        .await
     }
     pub async fn prepare_enrollment(
         &self,
@@ -257,6 +276,9 @@ async fn run(
     mut receiver: mpsc::UnboundedReceiver<Command>,
     start: Instant,
 ) {
+    #[cfg(feature = "bittorrent")]
+    let mut torrents =
+        supertrackr_bittorrent::Tracker::new(Default::default()).expect("valid tracker defaults");
     let diagnostics = std::env::var_os("SUPERTRACKR_COST_DIAGNOSTICS").is_some();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -281,6 +303,10 @@ async fn run(
                 let Some(command) = command else { break; };
                 let now = start.elapsed().as_secs();
                 match command {
+                    #[cfg(feature = "bittorrent")]
+                    Command::Torrent { who, request, reply } => {
+                        if !reply.is_closed() { let _ = reply.send(crate::bittorrent::execute(&registry, &mut torrents, who, request, now)); }
+                    },
                     Command::PrepareEnrollment{id,pending,reply}=>{if !reply.is_closed(){let _=reply.send(registry.prepare_enrollment(id,pending,now));}},
                     Command::FinishEnrollment{key,endpoint,id,answer_hash,token_hash,reply}=>{if !reply.is_closed(){let _=reply.send(registry.finish_enrollment(key,endpoint,id,answer_hash,token_hash,now));}},
                     Command::Register { key, endpoint, credentials, token_hash, reply } => {

@@ -2,7 +2,7 @@ use super::*;
 use std::{os::unix::fs::PermissionsExt, path::Path};
 use tun::AbstractDevice;
 pub enum Adapter {
-    Native(tun::AsyncDevice, String),
+    Native(tun::AsyncDevice, String, bool),
     Packet(UnixDatagram, PathBuf, PathBuf),
 }
 pub fn preflight() -> Result<()> {
@@ -42,7 +42,12 @@ pub fn preflight() -> Result<()> {
     Ok(())
 }
 impl Adapter {
-    pub async fn new(ip: Ipv4Addr, path: Option<&Path>, peer: Option<&Path>) -> Result<Self> {
+    pub async fn new(
+        ip: Ipv4Addr,
+        path: Option<&Path>,
+        peer: Option<&Path>,
+        exit: bool,
+    ) -> Result<Self> {
         if let Some(path) = path {
             // Require an owner-only parent so socket creation has no permission race.
             use std::os::unix::fs::MetadataExt;
@@ -64,7 +69,11 @@ impl Adapter {
             .address(ip)
             .destination(ip)
             .netmask(Ipv4Addr::new(255, 255, 255, 255))
-            .mtu(MTU as u16)
+            .mtu(if exit {
+                supertrackr::exit::MTU as u16
+            } else {
+                MTU as u16
+            })
             .up();
         #[cfg(target_os = "macos")]
         config.platform_config(|p| {
@@ -82,23 +91,76 @@ impl Adapter {
             )
             .into());
         }
-        Ok(Self::Native(device, name))
+        let adapter = Self::Native(device, name.clone(), exit);
+        if exit {
+            let address = supertrackr::exit::ipv6(ip).to_string();
+            let result = std::process::Command::new("/sbin/ifconfig")
+                .args([&name, "inet6", &address, "prefixlen", "128", "alias"])
+                .output()?;
+            if !result.status.success() {
+                return Err(format!(
+                    "IPv6 interface address failed: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                )
+                .into());
+            }
+            let route = std::process::Command::new("/sbin/route")
+                .args([
+                    "-n",
+                    "add",
+                    "-inet6",
+                    "default",
+                    "-interface",
+                    &name,
+                    "-ifscope",
+                    &name,
+                ])
+                .output()?;
+            if !route.status.success() {
+                return Err(format!(
+                    "IPv6 scoped route failed: {}",
+                    String::from_utf8_lossy(&route.stderr)
+                )
+                .into());
+            }
+            // Interface-scoped default leaves the host's unscoped default unchanged.
+            let route = std::process::Command::new("/sbin/route")
+                .args([
+                    "-n",
+                    "add",
+                    "-net",
+                    "default",
+                    "-interface",
+                    &name,
+                    "-ifscope",
+                    &name,
+                ])
+                .output()?;
+            if !route.status.success() {
+                return Err(format!(
+                    "scoped exit route failed: {}",
+                    String::from_utf8_lossy(&route.stderr)
+                )
+                .into());
+            }
+        }
+        Ok(adapter)
     }
     pub fn name(&self) -> &str {
         match self {
-            Self::Native(_, name) => name,
+            Self::Native(_, name, _) => name,
             Self::Packet(..) => "packet-socket-test-adapter",
         }
     }
     pub async fn recv(&self, p: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Self::Native(d, _) => d.recv(p).await,
+            Self::Native(d, _, _) => d.recv(p).await,
             Self::Packet(d, _, _) => d.recv(p).await,
         }
     }
     pub async fn send(&self, p: &[u8]) -> std::io::Result<usize> {
         match self {
-            Self::Native(d, _) => d.send(p).await,
+            Self::Native(d, _, _) => d.send(p).await,
             Self::Packet(d, _, peer) => d.send_to(p, peer).await,
         }
     }
@@ -109,7 +171,33 @@ impl Drop for Adapter {
             Self::Packet(_, path, _) => {
                 let _ = std::fs::remove_file(path);
             }
-            Self::Native(_, name) => {
+            Self::Native(_, name, exit) => {
+                if *exit {
+                    let _ = std::process::Command::new("/sbin/route")
+                        .args([
+                            "-n",
+                            "delete",
+                            "-inet6",
+                            "default",
+                            "-interface",
+                            name,
+                            "-ifscope",
+                            name,
+                        ])
+                        .output();
+                    let _ = std::process::Command::new("/sbin/route")
+                        .args([
+                            "-n",
+                            "delete",
+                            "-net",
+                            "default",
+                            "-interface",
+                            name,
+                            "-ifscope",
+                            name,
+                        ])
+                        .output();
+                }
                 // Scope deletion to our own interface, then close the utun descriptor.
                 let _ = std::process::Command::new("/sbin/route")
                     .args(["-n", "delete", "-net", "10.203.0.0/16", "-interface", name])

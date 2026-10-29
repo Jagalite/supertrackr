@@ -13,6 +13,8 @@ use tokio::{
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 mod control;
+mod delivery;
+mod exit;
 #[path = "../client/identity.rs"]
 mod identity;
 mod interface;
@@ -27,6 +29,25 @@ enum IntroductionMode {
 }
 #[derive(Parser)]
 struct Args {
+    /// Ordinary destinations: block, exit locally, or tunnel to an authorized gateway.
+    #[arg(long, value_enum, default_value_t=exit::Mode::OverlayOnly)]
+    exit_mode: exit::Mode,
+    #[arg(long, requires = "exit_gateway_key")]
+    exit_gateway: Option<Ipv4Addr>,
+    #[arg(long, requires = "exit_gateway")]
+    exit_gateway_key: Option<String>,
+    /// Explicit peer public keys permitted to use this machine as an exit (maximum 8).
+    #[arg(long)]
+    serve_exit_for: Vec<String>,
+    /// Also permit private/local destinations, including test echo servers.
+    #[arg(long)]
+    exit_allow_private: bool,
+    /// Local inbound mapping: tcp|udp,listen-address:port,application-port.
+    #[arg(long)]
+    exit_forward: Vec<supertrackr::exit::Forward>,
+    /// Gateway mapping: client-public-key,tcp|udp,listen-address:port,application-port.
+    #[arg(long)]
+    exit_forward_for: Vec<exit::PeerForward>,
     #[arg(long)]
     server: reqwest::Url,
     /// Preferred outbound introduction. Both modes are accepted on inbound connections.
@@ -101,6 +122,31 @@ async fn main() -> Result<()> {
     if a.portmap && (!a.allow_network || !a.listen.is_ipv4() || a.listen.ip().is_loopback()) {
         return Err("--portmap requires --allow-network and a non-loopback IPv4 bind".into());
     }
+    if (a.exit_mode == exit::Mode::Remote) != a.exit_gateway.is_some()
+        || a.exit_gateway
+            .is_some_and(|ip| !supertrackr::peer_manager::overlay(ip))
+        || a.serve_exit_for.len() > 8
+        || a.serve_exit_for
+            .iter()
+            .chain(a.exit_gateway_key.iter())
+            .any(|key| {
+                key.len() != 64 || hex::decode(key).is_err() || key != &key.to_ascii_lowercase()
+            })
+    {
+        return Err("remote exit requires an overlay gateway IP and lowercase public key; at most eight gateway clients".into());
+    }
+    if a.exit_forward.len() > 16
+        || (!a.exit_forward.is_empty() && a.exit_mode != exit::Mode::Local)
+        || a.exit_forward_for.len() > 128
+        || a.exit_forward_for
+            .iter()
+            .any(|f| !a.serve_exit_for.contains(&f.key))
+        || a.serve_exit_for
+            .iter()
+            .any(|key| a.exit_forward_for.iter().filter(|f| &f.key == key).count() > 16)
+    {
+        return Err("inbound mappings require local mode or an explicitly allowed gateway client; at most 16 per client".into());
+    }
     if a.packet_socket.is_none() {
         interface::preflight()?;
     }
@@ -132,8 +178,13 @@ async fn main() -> Result<()> {
         info.virtual_ip,
         a.packet_socket.as_deref(),
         a.packet_peer.as_deref(),
+        a.exit_mode != exit::Mode::OverlayOnly,
     )
     .await?;
+    if a.exit_gateway == Some(info.virtual_ip) {
+        return Err("exit gateway cannot be self".into());
+    }
+    let mut exits = exit::Exits::new(&a, info.virtual_ip)?;
     let mut lease = control.expires();
     let intro_key = *PublicKey::from(&secret).as_bytes();
     let mut manager = Manager::new(secret, info.virtual_ip);
@@ -141,10 +192,16 @@ async fn main() -> Result<()> {
         introduction::Introductions::new(a.server.as_str(), intro_key, Instant::now());
     let (requests, rx) = mpsc::channel(128);
     let (tx, mut events) = mpsc::channel(128);
+    // Proactively establish gateway/client bindings so inbound listeners do not
+    // depend on the application first initiating an Internet flow.
+    for key in a.serve_exit_for.iter().chain(a.exit_gateway_key.iter()) {
+        requests.try_send(control::Request::Peer(key.clone()))?;
+    }
+
     let (candidates, candidate_rx) = watch::channel(initial.clone());
     let mut worker = tokio::spawn(control.run(rx, tx, candidate_rx));
     let mut discovery = supertrackr::stun::Discovery::new(&a.stun);
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let stop = tokio::time::sleep(Duration::from_secs(if a.run_seconds == 0 {
         u64::from(u32::MAX)
@@ -155,13 +212,14 @@ async fn main() -> Result<()> {
     let mut udp = [0; 2049];
     let mut ip = [0; 2049];
     let mut io_dropped = 0u64;
+    let mut delivery = delivery::Queue::default();
     let mut puncher = punch::Puncher::new();
     let mut punch_sent = 0u64;
     let mut server_bindings_received = 0u64;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     println!(
         "{}",
-        serde_json::json!({"event":"ready","public_key":public,"virtual_ip":info.virtual_ip,"interface":adapter.name(),"endpoint":endpoint})
+        serde_json::json!({"event":"ready","public_key":public,"virtual_ip":info.virtual_ip,"interface":adapter.name(),"endpoint":endpoint,"exit_mode":format!("{:?}",a.exit_mode),"exit_ipv6":supertrackr::exit::ipv6(info.virtual_ip).to_string()})
     );
     let result:Result<()>=async {loop {
         if Instant::now()>=lease {return Err("local registration expired".into());}
@@ -171,6 +229,7 @@ async fn main() -> Result<()> {
             _=terminate.recv()=>break,
             _=&mut stop=>break,
             r=&mut worker=>{r??;return Err("control worker stopped".into());},
+            sent=delivery.send(lease, |p|adapter.send(p))=>{delivery.pop();if !sent {io_dropped+=1;}vec![]},
             _=tick.tick()=>{
                 let now=Instant::now();
                 if now>=mapping_at {mapping.retry();mapping_at=now+Duration::from_secs(15);}
@@ -180,9 +239,11 @@ async fn main() -> Result<()> {
                 candidates.send_if_modified(|old|if *old!=list {*old=list;true}else{false});
                 for (to,p) in puncher.due(now) {if socket.send_to(&p,to).await.is_ok(){punch_sent+=1;}else{io_dropped+=1;}}
                 actions.extend(introductions.tick(now));
-                manager.tick(now)
+                let (local,remote)=exits.poll(Instant::now()).await;
+                for p in local {if !delivery.push(p,lease,Instant::now()){io_dropped+=1;}}
+                let mut effects=manager.tick(Instant::now());for p in remote {effects.extend(manager.send(p,Instant::now()));}effects
             },
-            r=adapter.recv(&mut ip)=>{let n=r?;manager.send(ip[..n].to_vec(),Instant::now())},
+            r=adapter.recv(&mut ip)=>{let n=r?;if let Some(p)=exits.outbound(ip[..n].to_vec(),Instant::now()){manager.send(p,Instant::now())}else{vec![]}},
             r=socket.recv_from(&mut udp)=>{let(n,from)=r?;if !allowed(from,a.allow_network){io_dropped+=1;continue;}
                 if discovery.receive(from,&udp[..n],Instant::now().into()){continue;}
                 if punch::Puncher::is_probe(&udp[..n]){continue;}
@@ -215,6 +276,7 @@ async fn main() -> Result<()> {
                 },
                 control::Event::Refreshed(p,until)=>{
                     if until<=Instant::now() || p.candidates.iter().any(|&v|!allowed(v,a.allow_network)){continue;}
+                    if !exits.install(&p,until){io_dropped+=1;continue;}
                     manager.install(p,until,Instant::now()).unwrap_or_else(|_|{io_dropped+=1;vec![]})
                 },
             }
@@ -225,6 +287,7 @@ async fn main() -> Result<()> {
             introduction::Action::Verify(ticket)=>{if requests.try_send(control::Request::Verify(ticket)).is_err(){io_dropped+=1;}},
             introduction::Action::Install(p,until)=>{
                 let key=p.public_key.clone();
+                if !exits.install(&p,until){io_dropped+=1;continue;}
                 match manager.install(p,until,Instant::now()) {
                     Ok(e)=>{effects.extend(e);if requests.try_send(control::Request::Track(key,until)).is_err(){io_dropped+=1;}},
                     Err(_)=>{io_dropped+=1;},
@@ -235,7 +298,11 @@ async fn main() -> Result<()> {
             Effect::Network {to:Some(to),data,..}=>{if socket.send_to(&data,to).await.is_err(){io_dropped+=1;}},
             Effect::Network {to:None,..}=>{}, // Direct companion never calls the legacy HTTP relay.
             Effect::Resolve(ip)=>{if requests.try_send(control::Request::Resolve(ip)).is_err(){io_dropped+=1;}},
-            Effect::Deliver(p)=>{match tokio::time::timeout(Duration::from_millis(20),adapter.send(&p)).await {Ok(Ok(n)) if n==p.len()=>(),_=>io_dropped+=1}},
+            Effect::Deliver(p)=>{
+                let until=supertrackr::peer_manager::addresses(&p).and_then(|(src,_)|manager.peer_deadline(src)).unwrap_or_else(Instant::now).min(lease);
+                let Some(p)=exits.inbound(p,Instant::now()) else {continue;};
+                if !delivery.push(p,until,Instant::now()){io_dropped+=1;}
+            },
         }}
     } Ok(())}.await;
     worker.abort();

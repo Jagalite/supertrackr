@@ -360,3 +360,18 @@ Duplex buffers expose AsyncRead/AsyncWrite streams. The task drives timers and
 bridges packets without application polling. Authenticated peer installation and
 lease renewal remain explicit control operations. Cancellation, half-close,
 drop-draining, and terminal failure contracts are documented in USERSPACE.md.
+
+## Optional companion exit forwarding
+
+The companion defaults to overlay-only operation. Local and pinned remote exit
+modes proxy IPv4/IPv6 TCP and UDP through bounded host sockets. Remote envelopes
+retain authenticated IPv4 overlay endpoints; inner IPv6 ownership derives from
+the registered IPv4 identity under fdcb::/96. Protocol-252 exit envelopes have a
+1304-byte ceiling to carry an IPv6-minimum-MTU packet without lowering the
+interface MTU below 1280. Ordinary overlay packets retain the existing limit.
+
+Explicit per-client TCP/UDP listeners provide inbound Internet access and are
+closed with the client's lease. IPv6 listeners are v6-only, so separately
+configured IPv4 and IPv6 listeners can share a port. Native scoped routes and
+IPv6 interface setup still require privileged validation. See
+[EXIT-MODES.md](docs/EXIT-MODES.md) for configuration, lifecycle and limitations.

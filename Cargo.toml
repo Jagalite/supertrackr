@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/supertrackr-bittorrent"]
+resolver = "3"
+
 [package]
 name = "supertrackr"
 version = "0.1.0"
@@ -6,10 +10,13 @@ rust-version = "1.91"
 
 [features]
 default = []
+bittorrent = ["dep:supertrackr-bittorrent"]
 router-mapping = ["dep:portmapper"]
 
 [dependencies]
-smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+socket2 = "0.6"
+supertrackr-bittorrent = { path = "crates/supertrackr-bittorrent", optional = true }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 crypto_box = "=0.9.1"
 hmac = "0.12"
 tun = { version = "=0.8.14", features = ["async"] }

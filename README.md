@@ -309,7 +309,8 @@ connectivity and accounting assertions passed, not lossless delivery or capacity
 It discovers virtual destinations through the configured tracker, then exchanges
 public-key introductions directly between companions over UDP. The receiver checks
 registration with its configured tracker; WireGuard proves private-key possession. The server allocates addresses in `10.203.0.0/16`; only this subnet is
-routed into the interface. No default-route or DNS changes are made.
+routed into the interface by default. Optional exit modes add interface-scoped
+default routes without changing the host defaults or DNS; see [EXIT-MODES.md](docs/EXIT-MODES.md).
 
 Build through Kyoto:
 
@@ -341,7 +342,9 @@ re-enrolling the same key until its lease has expired and cleanup runs.
 This is a root CLI, not a packaged macOS VPN app. The native adapter compiles but
 has **not been run with administrator privileges** in this session. Real TCP/UDP
 application acceptance through utun and route cleanup still need that test.
-IPv4 only, MTU 1280, at most 64 active peer sessions; overlay route conflicts are
+Overlay peer routing is IPv4 only; optional Internet exit forwarding supports
+IPv4/IPv6 TCP/UDP and explicit inbound mappings. MTU is 1280, with at most 64 active
+peer sessions; overlay route conflicts are
 rejected. Tracker restarts invalidate registrations and require clearing application
 address caches before re-enrollment. BitTorrent announce integration is separate.
 
@@ -417,3 +420,16 @@ and UDP over WireGuard without an OS virtual interface. TCP streams implement
 Tokio AsyncRead/AsyncWrite; one background task owns polling and UDP I/O. Tracker
 control remains explicit. The lower-level `userspace::Network` API is also available. See [the API guide](docs/USERSPACE.md) and the runnable
 [tracker-backed TCP/UDP echo example](examples/userspace_echo.rs).
+
+## Optional BitTorrent swarm tracking
+
+The `bittorrent` Cargo feature enables an authenticated overlay swarm API backed
+by the separate `supertrackr-bittorrent` library. See [BITTORRENT.md](docs/BITTORRENT.md)
+for request formats, limits and client integration. Default builds remain generic.
+
+## Interface exit options
+
+The companion can optionally forward ordinary IPv4/IPv6 TCP/UDP locally or through an
+explicitly authorized WireGuard gateway. Overlay-only remains the default. See
+[EXIT-MODES.md](docs/EXIT-MODES.md) for flags, gateway setup and current transport
+and native-routing validation limits.
