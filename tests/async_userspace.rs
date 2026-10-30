@@ -62,6 +62,164 @@ fn err<T>(result: io::Result<T>) -> io::Error {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn linked_wireguard_credentials_exchange_traffic_and_survive_peer_revocation() {
+    use supertrackr::{Config, Coordinator, InterfaceInfo, enrollment, router};
+    timeout(Duration::from_secs(20), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: reqwest::Url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let state = Coordinator::with_audience(
+            Config {
+                open_registration: true,
+                ..Config::default()
+            },
+            base.to_string(),
+        );
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut nodes = Vec::new();
+        for n in [41u8, 42, 43] {
+            let secret = StaticSecret::from([n; 32]);
+            let key = hex::encode(PublicKey::from(&secret).as_bytes());
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = udp.local_addr().unwrap();
+            let registration = enrollment::register(&http, &base, &secret, endpoint)
+                .await
+                .unwrap();
+            http.post(base.join("v1/candidates").unwrap())
+                .header("x-peer-key", &key)
+                .bearer_auth(&registration.token)
+                .json(&serde_json::json!({"candidates":[endpoint]}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let interface: InterfaceInfo = http
+                .get(base.join("v1/interface").unwrap())
+                .header("x-peer-key", &key)
+                .bearer_auth(&registration.token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            nodes.push((secret, key, registration.token, endpoint, udp, interface));
+        }
+        let linked = enrollment::link_registered_wireguard(
+            &http,
+            &base,
+            &nodes[0].1,
+            &nodes[0].2,
+            &nodes[1].0,
+            nodes[1].3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(linked.wireguard_keys.len(), 2);
+        let mut bindings = Vec::new();
+        for (requester, target) in [(2, 0), (2, 1), (0, 2), (1, 2)] {
+            let binding: CandidatePeer = http
+                .post(base.join("v1/binding").unwrap())
+                .header("x-peer-key", &nodes[requester].1)
+                .bearer_auth(&nodes[requester].2)
+                .json(&serde_json::json!({"public_key":nodes[target].1}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            bindings.push(binding);
+        }
+        let until = Instant::now() + Duration::from_secs(30);
+        let owner_key = nodes[0].1.clone();
+        let added_key = nodes[1].1.clone();
+        let added_token = nodes[1].2.clone();
+        let remote_key = nodes[2].1.clone();
+        let remote_token = nodes[2].2.clone();
+        let mut clients = Vec::new();
+        for (secret, _, _, _, udp, interface) in nodes.drain(..) {
+            let network = Network::new(secret, interface.virtual_ip, until).unwrap();
+            clients.push(Client::spawn(network, udp).0);
+        }
+        clients[2]
+            .install_peer(bindings[0].clone(), until)
+            .await
+            .unwrap();
+        clients[2]
+            .install_peer(bindings[1].clone(), until)
+            .await
+            .unwrap();
+        clients[0]
+            .install_peer(bindings[2].clone(), until)
+            .await
+            .unwrap();
+        clients[1]
+            .install_peer(bindings[3].clone(), until)
+            .await
+            .unwrap();
+        let sender = clients[2].bind_udp(9000).await.unwrap();
+        let mut old = clients[0].bind_udp(9000).await.unwrap();
+        let mut new = clients[1].bind_udp(9000).await.unwrap();
+        for (binding, receiver) in [(&bindings[0], &mut old), (&bindings[1], &mut new)] {
+            sender
+                .send_to(b"linked", SocketAddrV4::new(binding.virtual_ip, 9000))
+                .await
+                .unwrap();
+            let mut buffer = [0; 32];
+            let (n, _) = receiver.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(&buffer[..n], b"linked");
+        }
+        assert_eq!(
+            http.post(base.join("v1/identity/revoke").unwrap())
+                .header("x-peer-key", &added_key)
+                .bearer_auth(&added_token)
+                .json(&serde_json::json!({"public_key":owner_key}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            http.post(base.join("v1/binding").unwrap())
+                .header("x-peer-key", &remote_key)
+                .bearer_auth(&remote_token)
+                .json(&serde_json::json!({"public_key":owner_key}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+        sender
+            .send_to(
+                b"remaining",
+                SocketAddrV4::new(bindings[1].virtual_ip, 9000),
+            )
+            .await
+            .unwrap();
+        let mut buffer = [0; 32];
+        let (n, _) = new.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"remaining");
+        for client in clients {
+            client.shutdown().await.unwrap();
+        }
+        server.abort();
+    })
+    .await
+    .expect("linked WireGuard exchange stalled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_tcp_large_transfer_half_close_and_drop_preserve_queued_bytes() {
     timeout(Duration::from_secs(15), async {
         let (a, b) = pair().await;

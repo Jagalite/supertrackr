@@ -8,7 +8,11 @@ pub mod exit;
 pub mod model;
 mod path_selection;
 pub mod peer_manager;
+#[cfg(feature = "bittorrent")]
+pub mod standard_tracker;
 pub mod stun;
+#[cfg(feature = "bittorrent")]
+pub mod udp_tracker;
 pub mod userspace;
 use axum::{
     Json, Router,
@@ -325,11 +329,102 @@ async fn punch_hints(
             .map_err(status)?,
     ))
 }
+#[derive(Serialize, Deserialize, Debug)]
+pub struct IdentityResponse {
+    pub identity: String,
+    pub wireguard_keys: Vec<String>,
+}
+async fn identity(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+) -> Result<Json<IdentityResponse>> {
+    let (identity, keys) = s.identity(credentials(&headers)?).await.map_err(status)?;
+    Ok(Json(IdentityResponse {
+        identity: hex::encode(identity),
+        wireguard_keys: keys.into_iter().map(hex::encode).collect(),
+    }))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndpointRequest {
+    endpoint: SocketAddr,
+    ttl_seconds: u64,
+}
+#[derive(Serialize)]
+struct EndpointResponse {
+    expires_in_seconds: u64,
+}
+async fn publish_endpoint(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<EndpointRequest>,
+) -> Result<Json<EndpointResponse>> {
+    let expires_in_seconds = s
+        .publish_endpoint(credentials(&headers)?, q.endpoint, q.ttl_seconds)
+        .await
+        .map_err(status)?;
+    Ok(Json(EndpointResponse { expires_in_seconds }))
+}
+async fn link_challenge(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<enrollment::ChallengeRequest>,
+) -> Result<Json<enrollment::Challenge>> {
+    let who = credentials(&headers)?;
+    let (identity, _) = s.identity(who).await.map_err(status)?;
+    let (challenge, pending) = enrollment::issue(
+        parse_key(&q.public_key)?,
+        q.endpoint,
+        parse_key(&q.client_nonce)?,
+        &enrollment::link_audience(&s.registration_audience, &identity),
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    s.prepare_link(who, identity, parse_key(&challenge.id)?, pending)
+        .await
+        .map_err(status)?;
+    Ok(Json(challenge))
+}
+async fn finish_link(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(proof): Json<enrollment::Proof>,
+) -> Result<Json<IdentityResponse>> {
+    let who = credentials(&headers)?;
+    let answer = parse_key(&proof.response)?;
+    let (identity, keys) = s
+        .finish_link(who, parse_key(&proof.id)?, Sha256::digest(answer).into())
+        .await
+        .map_err(status)?;
+    Ok(Json(IdentityResponse {
+        identity: hex::encode(identity),
+        wireguard_keys: keys.into_iter().map(hex::encode).collect(),
+    }))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeCredentialRequest {
+    public_key: String,
+}
+async fn revoke_credential(
+    State(s): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(q): Json<RevokeCredentialRequest>,
+) -> Result<StatusCode> {
+    s.revoke_credential(credentials(&headers)?, parse_key(&q.public_key)?)
+        .await
+        .map_err(status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
 pub fn router(s: Arc<Coordinator>) -> Router {
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/register", post(register))
         .route("/v1/register/challenge", post(challenge))
+        .route("/v1/identity", get(identity))
+        .route("/v1/endpoint", post(publish_endpoint))
+        .route("/v1/identity/link/challenge", post(link_challenge))
+        .route("/v1/identity/link", post(finish_link))
+        .route("/v1/identity/revoke", post(revoke_credential))
         .route("/v1/peers", get(get_peers))
         .route("/v1/verify", post(verify_peer))
         .route("/v1/candidates", post(candidates))

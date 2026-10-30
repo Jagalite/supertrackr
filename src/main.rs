@@ -12,6 +12,14 @@ struct Args {
     cert: Option<PathBuf>,
     #[arg(long)]
     key: Option<PathBuf>,
+    /// Explicitly enable the separate plaintext standard HTTP tracker listener.
+    #[cfg(feature = "bittorrent")]
+    #[arg(long)]
+    tracker_http_listen: Option<SocketAddr>,
+    /// Explicitly enable the separate standard UDP tracker listener.
+    #[cfg(feature = "bittorrent")]
+    #[arg(long)]
+    tracker_udp_listen: Option<SocketAddr>,
     /// Optional UDP STUN mapping reflector (separate from the HTTP tracker).
     #[arg(long)]
     stun_listen: Option<SocketAddr>,
@@ -38,6 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if a.lab_http && a.stun_listen.is_some_and(|addr| !addr.ip().is_loopback()) {
         return Err("lab STUN listener must be loopback".into());
     }
+    #[cfg(feature = "bittorrent")]
+    let tracker_socket = if let Some(addr) = a.tracker_http_listen {
+        Some(tokio::net::TcpListener::bind(addr).await?)
+    } else {
+        None
+    };
+    #[cfg(feature = "bittorrent")]
+    let tracker_udp_socket = if let Some(addr) = a.tracker_udp_listen {
+        Some(tokio::net::UdpSocket::bind(addr).await?)
+    } else {
+        None
+    };
+    #[cfg(feature = "bittorrent")]
+    let tracker_state = supertrackr::standard_tracker::TrackerState::new();
     let stun_socket = if let Some(addr) = a.stun_listen {
         Some(tokio::net::UdpSocket::bind(addr).await?)
     } else {
@@ -109,5 +131,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => std::future::pending().await,
         }
     };
-    tokio::select! { result=http=>result, result=stun=>{result?;Err("STUN task stopped".into())} }
+    #[cfg(feature = "bittorrent")]
+    let tracker = async {
+        match tracker_socket {
+            Some(socket) => {
+                axum::serve(
+                    socket,
+                    supertrackr::standard_tracker::router(tracker_state.clone())
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    #[cfg(not(feature = "bittorrent"))]
+    let tracker = std::future::pending::<std::io::Result<()>>();
+    #[cfg(feature = "bittorrent")]
+    let tracker_udp = async {
+        match tracker_udp_socket {
+            Some(socket) => {
+                supertrackr::standard_tracker::serve_udp(socket, tracker_state.clone()).await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    #[cfg(not(feature = "bittorrent"))]
+    let tracker_udp = std::future::pending::<std::io::Result<()>>();
+    tokio::select! { result=http=>result, result=stun=>{result?;Err("STUN task stopped".into())}, result=tracker=>{result?;Err("standard tracker stopped".into())}, result=tracker_udp=>{result?;Err("UDP tracker stopped".into())} }
 }

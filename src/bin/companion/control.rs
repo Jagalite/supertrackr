@@ -26,7 +26,32 @@ pub struct Control {
     refresh: Instant,
     introduction: IntroductionMode,
 }
+#[cfg(feature = "bittorrent")]
+#[derive(Clone)]
+pub struct TrackerAccess {
+    pub http: reqwest::Client,
+    pub base: reqwest::Url,
+    pub public: String,
+    pub token: String,
+}
+#[cfg(feature = "bittorrent")]
+impl TrackerAccess {
+    pub fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("x-peer-key", &self.public)
+            .bearer_auth(&self.token)
+    }
+}
 impl Control {
+    #[cfg(feature = "bittorrent")]
+    pub fn tracker_access(&self) -> TrackerAccess {
+        TrackerAccess {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            public: self.public.clone(),
+            token: self.token.clone(),
+        }
+    }
     pub async fn new(
         base: reqwest::Url,
         public: String,

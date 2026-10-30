@@ -42,7 +42,7 @@ struct Message<T> {
     data: T,
 }
 pub(super) struct Mailbox {
-    candidates: Vec<SocketAddr>,
+    pub(super) candidates: Vec<SocketAddr>,
     virtual_ip: Ipv4Addr,
     selected: HashMap<Key, Key>,
     requests: VecDeque<Message<()>>,
@@ -81,10 +81,19 @@ pub fn valid_endpoint(endpoint: SocketAddr) -> bool {
         && !matches!(endpoint.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast())
 }
 impl Registry {
-    fn mutual(&self, who: Credentials, target: Key) -> bool {
+    fn mutual(&self, who: Credentials, target: Key, now: u64) -> bool {
         let Some(record) = self.records.get(&target) else {
             return false;
         };
+        let Some(caller) = self.records.get(&who.key) else {
+            return false;
+        };
+        if caller.identity == record.identity
+            || caller.endpoint_expires <= now
+            || record.endpoint_expires <= now
+        {
+            return false;
+        }
         self.traversal
             .peers
             .get(&who.key)
@@ -138,7 +147,15 @@ impl Registry {
         include_binding: bool,
         now: u64,
     ) -> Result<()> {
-        self.candidate_peer(who, target, now)?;
+        let peer = self.candidate_peer(who, target, now)?;
+        let caller_until = self.records[&who.key].endpoint_expires;
+        if caller_until <= now {
+            return Err(Error::Conflict);
+        }
+        let until = now
+            .saturating_add(5)
+            .min(caller_until)
+            .min(now.saturating_add(peer.remaining_seconds));
         let caller = self
             .traversal
             .peers
@@ -164,7 +181,7 @@ impl Registry {
         }
         target.punches.push_back(Message {
             sender: who,
-            until: now.saturating_add(5),
+            until,
             data: include_binding,
         });
         Ok(())
@@ -242,6 +259,9 @@ impl Registry {
         let lease = self.authenticate(who, now)?;
         let p = self.peer(who.key, lease, target, None, now)?;
         let m = self.traversal.peers.get(&target).ok_or(Error::NotFound)?;
+        if m.candidates.is_empty() {
+            return Err(Error::NotFound);
+        }
         Ok(CandidatePeer {
             public_key: hex::encode(target),
             endpoint: p.endpoint,
@@ -252,6 +272,14 @@ impl Registry {
     }
     pub fn connect(&mut self, who: Credentials, target: Key, now: u64) -> Result<CandidatePeer> {
         let peer = self.candidate_peer(who, target, now)?;
+        let caller_until = self.records[&who.key].endpoint_expires;
+        if caller_until <= now {
+            return Err(Error::Conflict);
+        }
+        let until = now
+            .saturating_add(MESSAGE_TTL)
+            .min(caller_until)
+            .min(now.saturating_add(peer.remaining_seconds));
         if !self.traversal.peers.contains_key(&who.key) {
             return Err(Error::Conflict);
         }
@@ -265,7 +293,7 @@ impl Registry {
         if !selected.contains_key(&target) && selected.len() >= MAX_CONNECTIONS {
             return Err(Error::Unavailable);
         }
-        if self.mutual(who, target) {
+        if self.mutual(who, target, now) {
             return Ok(peer);
         }
         let m = self.traversal.peers.get_mut(&target).unwrap();
@@ -276,7 +304,7 @@ impl Registry {
         }
         m.requests.push_back(Message {
             sender: who,
-            until: now.saturating_add(MESSAGE_TTL),
+            until,
             data: (),
         });
         self.traversal
@@ -299,9 +327,13 @@ impl Registry {
         if packet.is_empty() || packet.len() > MAX_DATAGRAM {
             return Err(Error::BadRequest);
         }
-        if !self.mutual(who, target) {
+        if !self.mutual(who, target, now) {
             return Err(Error::Conflict);
         }
+        let until = now
+            .saturating_add(MESSAGE_TTL)
+            .min(self.records[&who.key].endpoint_expires)
+            .min(self.records[&target].endpoint_expires);
         let m = self.traversal.peers.get_mut(&target).unwrap();
         let before = m.packets.len();
         m.packets.retain(|p| now < p.until);
@@ -311,7 +343,7 @@ impl Registry {
         }
         m.packets.push_back(Message {
             sender: who,
-            until: now.saturating_add(MESSAGE_TTL),
+            until,
             data: packet,
         });
         self.traversal.packets += 1;
@@ -339,7 +371,7 @@ impl Registry {
         }
         for p in packets {
             if now < p.until
-                && self.mutual(who, p.sender.key)
+                && self.mutual(who, p.sender.key, now)
                 && self.authenticate(p.sender, now).is_ok()
             {
                 events.packets.push(RelayPacket {
@@ -426,6 +458,40 @@ mod tests {
             r.relay(a, b.key, vec![0; MAX_DATAGRAM + 1], 0),
             Err(Error::BadRequest)
         );
+    }
+    #[test]
+    fn endpoint_expiry_caps_queued_relay_even_if_endpoint_is_renewed() {
+        let (mut r, a, b, addr) = setup();
+        r.publish_endpoint(a, addr, 2, 0).unwrap();
+        r.connect(a, b.key, 0).unwrap();
+        r.connect(b, a.key, 0).unwrap();
+        r.relay(a, b.key, vec![1], 0).unwrap();
+        assert_eq!(r.relay(a, b.key, vec![2], 2), Err(Error::Conflict));
+        r.publish_endpoint(a, addr, 10, 2).unwrap();
+        r.set_candidates(a, vec![addr], 2).unwrap();
+        assert!(r.events(b, 2).unwrap().packets.is_empty());
+        r.relay(a, b.key, vec![3], 2).unwrap();
+        assert_eq!(r.events(b, 3).unwrap().packets.len(), 1);
+        r.relay(a, b.key, vec![4], 3).unwrap();
+        r.publish_endpoint(a, addr, 1, 3).unwrap();
+        // The previous message was already issued under a longer endpoint lease;
+        // renewal never extends the deadline that was assigned on enqueue.
+        r.publish_endpoint(a, addr, 10, 4).unwrap();
+        r.set_candidates(a, vec![addr], 4).unwrap();
+        assert_eq!(r.events(b, 4).unwrap().packets.len(), 1);
+    }
+    #[test]
+    fn explicit_endpoint_requires_fresh_candidates_after_change_or_expiry() {
+        let (mut r, a, b, _) = setup();
+        let changed = "127.0.0.1:4321".parse().unwrap();
+        r.publish_endpoint(b, changed, 2, 1).unwrap();
+        assert!(matches!(r.binding(a, b.key, 1), Err(Error::NotFound)));
+        r.set_candidates(b, vec![changed], 1).unwrap();
+        assert_eq!(r.binding(a, b.key, 1).unwrap().candidates, vec![changed]);
+        r.publish_endpoint(b, changed, 5, 3).unwrap();
+        assert!(matches!(r.binding(a, b.key, 3), Err(Error::NotFound)));
+        r.set_candidates(b, vec![changed], 3).unwrap();
+        assert_eq!(r.binding(a, b.key, 3).unwrap().candidates, vec![changed]);
     }
     #[test]
     fn relay_is_bounded_expires_and_rechecks_source_session() {

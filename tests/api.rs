@@ -95,6 +95,276 @@ async fn reg(app: &Router, n: u64) -> (String, String) {
     (k, b["token"].as_str().unwrap().to_owned())
 }
 #[tokio::test]
+async fn identity_inspection_requires_auth_and_revoke_cannot_remove_unrelated_peers() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 7201).await;
+    let (b, bt) = reg(&app, 7202).await;
+    assert_eq!(
+        call(&app, "GET", "/v1/identity", None, Value::Null).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (code, data) = call(&app, "GET", "/v1/identity", Some((&a, &at)), Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(data["identity"].as_str().unwrap().len(), 64);
+    assert_eq!(data["wireguard_keys"], json!([a]));
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/identity/revoke",
+            Some((&a, &at)),
+            json!({"public_key": b})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&app, "GET", "/v1/identity", Some((&b, &bt)), Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+#[tokio::test]
+async fn endpoint_publication_requires_credential_and_does_not_refresh_it() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ttl_seconds: 20,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 7401).await;
+    let (b, bt) = reg(&app, 7402).await;
+    let request = json!({"endpoint":"127.0.0.1:51999","ttl_seconds":5});
+    assert_eq!(
+        call(&app, "POST", "/v1/endpoint", None, request.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (code, body) = call(&app, "POST", "/v1/endpoint", Some((&a, &at)), request).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body["expires_in_seconds"].as_u64().unwrap() <= 5);
+    let (code, peers) = call(
+        &app,
+        "GET",
+        "/v1/peers?limit=10",
+        Some((&b, &bt)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(peers[0]["endpoint"], "127.0.0.1:51999");
+    assert!(peers[0]["remaining_seconds"].as_u64().unwrap() <= 5);
+    let (code, _) = call(
+        &app,
+        "POST",
+        "/v1/endpoint",
+        Some((&a, &at)),
+        json!({"endpoint":"127.0.0.1:51999","ttl_seconds":0}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+}
+#[tokio::test]
+async fn identity_link_requires_fresh_key_proof_and_revocation_invalidates_session() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (a, at) = reg(&app, 7301).await;
+    let (b, bt) = reg(&app, 7302).await;
+    let (c, ct) = reg(&app, 7303).await;
+    let (_, identity) = call(&app, "GET", "/v1/identity", Some((&a, &at)), Value::Null).await;
+    let mut identity_bytes = [0; 32];
+    hex::decode_to_slice(identity["identity"].as_str().unwrap(), &mut identity_bytes).unwrap();
+    let nonce = [9; 32];
+    let endpoint: std::net::SocketAddr = "127.0.0.1:51820".parse().unwrap();
+    assert_eq!(call(&app, "POST", "/v1/identity/link/challenge", Some((&a, &at)), json!({"public_key":b,"endpoint":endpoint.to_string(),"client_nonce":hex::encode(nonce),"credential_type":"quic"})).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, challenge) = call(
+        &app,
+        "POST",
+        "/v1/identity/link/challenge",
+        Some((&a, &at)),
+        json!({"public_key":b,"endpoint":endpoint.to_string(),"client_nonce":hex::encode(nonce)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = serde_json::from_value(challenge).unwrap();
+    let bytes = *secrets().lock().unwrap().get(&b).unwrap();
+    assert!(
+        supertrackr::enrollment::solve(
+            &challenge,
+            &boringtun::x25519::StaticSecret::from([99; 32]),
+            endpoint,
+            nonce,
+            &supertrackr::enrollment::link_audience("http://localhost/", &identity_bytes),
+        )
+        .is_err()
+    );
+    let wrong_audience = supertrackr::enrollment::solve(
+        &challenge,
+        &boringtun::x25519::StaticSecret::from(bytes),
+        endpoint,
+        nonce,
+        &supertrackr::enrollment::link_audience("https://other.example/", &identity_bytes),
+    )
+    .unwrap();
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/identity/link",
+            Some((&a, &at)),
+            serde_json::to_value(wrong_audience).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let proof = supertrackr::enrollment::solve(
+        &challenge,
+        &boringtun::x25519::StaticSecret::from(bytes),
+        endpoint,
+        nonce,
+        &supertrackr::enrollment::link_audience("http://localhost/", &identity_bytes),
+    )
+    .unwrap();
+    let proof = serde_json::to_value(proof).unwrap();
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/identity/link",
+            Some((&c, &ct)),
+            proof.clone()
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, linked) = call(
+        &app,
+        "POST",
+        "/v1/identity/link",
+        Some((&a, &at)),
+        proof.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(linked["wireguard_keys"].as_array().unwrap().len(), 2);
+    #[cfg(feature = "bittorrent")]
+    {
+        for (key, token) in [(&a, &at), (&b, &bt), (&c, &ct)] {
+            assert_eq!(
+                call(
+                    &app,
+                    "POST",
+                    "/v1/candidates",
+                    Some((key, token)),
+                    json!({"candidates":["127.0.0.1:51820"]})
+                )
+                .await
+                .0,
+                StatusCode::NO_CONTENT
+            );
+        }
+        let announce =
+            json!({"event":"announce","info_hash":"01".repeat(20),"port":6881,"complete":true});
+        for (key, token) in [(&a, &at), (&b, &bt)] {
+            assert_eq!(
+                call(
+                    &app,
+                    "POST",
+                    "/v1/bittorrent",
+                    Some((key, token)),
+                    announce.clone()
+                )
+                .await
+                .1["peers"],
+                json!([])
+            );
+        }
+        let (code, result) = call(&app, "POST", "/v1/bittorrent", Some((&c, &ct)), announce).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(result["peers"].as_array().unwrap().len(), 1);
+        assert_eq!(result["seeders"], 2);
+        assert_eq!(result["leechers"], 0);
+    }
+    assert_eq!(
+        call(&app, "POST", "/v1/identity/link", Some((&a, &at)), proof)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/identity/revoke",
+            Some((&a, &at)),
+            json!({"public_key":b})
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&app, "GET", "/v1/identity", Some((&b, &bt)), Value::Null)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+#[tokio::test]
+async fn identity_link_client_helper_works_over_http() {
+    use boringtun::x25519::{PublicKey, StaticSecret};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base: reqwest::Url = format!("http://{}/", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let app = router(Coordinator::with_audience(
+        Config {
+            open_registration: true,
+            ..Config::default()
+        },
+        base.to_string(),
+    ));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let owner = StaticSecret::from([61; 32]);
+    let added = StaticSecret::from([62; 32]);
+    let endpoint = "127.0.0.1:51820".parse().unwrap();
+    let registered = supertrackr::enrollment::register(&http, &base, &owner, endpoint)
+        .await
+        .unwrap();
+    supertrackr::enrollment::register(&http, &base, &added, endpoint)
+        .await
+        .unwrap();
+    let owner_key = hex::encode(PublicKey::from(&owner).as_bytes());
+    let result = supertrackr::enrollment::link_registered_wireguard(
+        &http,
+        &base,
+        &owner_key,
+        &registered.token,
+        &added,
+        endpoint,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.wireguard_keys.len(), 2);
+    assert!(result.wireguard_keys.contains(&owner_key));
+    assert!(
+        result
+            .wireguard_keys
+            .contains(&hex::encode(PublicKey::from(&added).as_bytes()))
+    );
+    server.abort();
+}
+#[tokio::test]
 async fn discovery_verification_and_authenticated_refresh() {
     let state = Coordinator::new(Config {
         open_registration: true,
@@ -1131,4 +1401,67 @@ async fn overlay_swarm_announce_discovery_and_stop() {
     .await;
     assert_eq!(scrape["seeders"], 0);
     assert_eq!(scrape["leechers"], 0);
+}
+
+#[cfg(feature = "bittorrent")]
+#[tokio::test]
+async fn overlay_tracks_multiple_application_ids_per_credential() {
+    let app = router(Coordinator::new(Config {
+        open_registration: true,
+        ..Config::default()
+    }));
+    let (owner, token) = reg(&app, 7501).await;
+    let (other, other_token) = reg(&app, 7502).await;
+    for (key, token) in [(&owner, &token), (&other, &other_token)] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/v1/candidates",
+                Some((key, token)),
+                json!({"candidates":["127.0.0.1:51820"]})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let hash = "01".repeat(20);
+    let one = "11".repeat(20);
+    let two = "22".repeat(20);
+    for (id, port) in [(&one, 6881), (&two, 6882)] {
+        assert_eq!(call(&app,"POST","/v1/bittorrent",Some((&owner,&token)),json!({"event":"announce","info_hash":hash,"application_id":id,"port":port,"complete":false})).await.0, StatusCode::OK);
+    }
+    let (_, peers) = call(
+        &app,
+        "POST",
+        "/v1/bittorrent",
+        Some((&other, &other_token)),
+        json!({"event":"announce","info_hash":hash,"port":6883,"complete":false}),
+    )
+    .await;
+    assert_eq!(peers["peers"].as_array().unwrap().len(), 2);
+    assert_eq!(peers["leechers"], 3);
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/bittorrent",
+            Some((&owner, &token)),
+            json!({"event":"stopped","info_hash":hash,"application_id":one})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, peers) = call(
+        &app,
+        "POST",
+        "/v1/bittorrent",
+        Some((&other, &other_token)),
+        json!({"event":"announce","info_hash":hash,"port":6883,"complete":false}),
+    )
+    .await;
+    assert_eq!(peers["peers"].as_array().unwrap().len(), 1);
+    assert_eq!(peers["peers"][0]["application_id"], two);
 }

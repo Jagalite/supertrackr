@@ -22,6 +22,10 @@ mod introduction;
 #[path = "../client/mapping.rs"]
 mod mapping;
 mod punch;
+#[cfg(feature = "bittorrent")]
+mod tracker_bridge;
+#[cfg(feature = "bittorrent")]
+mod udp_upstream;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum IntroductionMode {
     Direct,
@@ -29,6 +33,14 @@ enum IntroductionMode {
 }
 #[derive(Parser)]
 struct Args {
+    /// Local HTTP tracker adapter for interface-bound standard torrent clients.
+    #[cfg(feature = "bittorrent")]
+    #[arg(long)]
+    tracker_bridge_listen: Option<SocketAddr>,
+    /// Optional ordinary HTTP(S) or UDP tracker URL for Internet peers.
+    #[cfg(feature = "bittorrent")]
+    #[arg(long, requires = "tracker_bridge_listen")]
+    tracker_upstream: Option<reqwest::Url>,
     /// Ordinary destinations: block, exit locally, or tunnel to an authorized gateway.
     #[arg(long, value_enum, default_value_t=exit::Mode::OverlayOnly)]
     exit_mode: exit::Mode,
@@ -81,9 +93,48 @@ fn allowed(addr: SocketAddr, network: bool) -> bool {
         && (network || addr.ip().is_loopback())
         && !matches!(addr.ip().to_canonical(),std::net::IpAddr::V4(ip) if ip.octets()[..2]==[10,203])
 }
+#[cfg(feature = "bittorrent")]
+fn valid_tracker_upstream(url: &reqwest::Url) -> bool {
+    udp_upstream::valid_url(url)
+        || (matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && url.path().ends_with("/announce"))
+}
+#[cfg(all(test, feature = "bittorrent"))]
+mod tracker_url_tests {
+    use super::valid_tracker_upstream;
+
+    #[test]
+    fn accepts_query_credentials_but_rejects_userinfo_and_fragments() {
+        for (url, valid) in [
+            ("https://tracker.example/announce?passkey=secret", true),
+            ("http://tracker.example/announce", true),
+            ("https://user:secret@tracker.example/announce", false),
+            ("https://tracker.example/announce#fragment", false),
+            ("udp://tracker.example/announce", false),
+            ("udp://tracker.example:6969/announce", true),
+            ("udp://[::1]:6969/announce?passkey=secret", true),
+            ("udp://user:secret@tracker.example:6969/announce", false),
+            ("https://tracker.example/scrape?passkey=secret", false),
+        ] {
+            assert_eq!(valid_tracker_upstream(&url.parse().unwrap()), valid);
+        }
+    }
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let a = Args::parse();
+    #[cfg(feature = "bittorrent")]
+    if a.tracker_bridge_listen
+        .is_some_and(|address| !address.ip().is_loopback())
+        || a.tracker_upstream
+            .as_ref()
+            .is_some_and(|url| !valid_tracker_upstream(url))
+    {
+        return Err("tracker bridge must bind loopback and upstream must be a valid HTTP(S) announce or UDP tracker URL without userinfo or fragment".into());
+    }
     if !a.server.username().is_empty()
         || a.server.password().is_some()
         || a.server.query().is_some()
@@ -174,6 +225,23 @@ async fn main() -> Result<()> {
         &secret,
     )
     .await?;
+    #[cfg(feature = "bittorrent")]
+    let bridge_server = if let Some(address) = a.tracker_bridge_listen {
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let bridge = tracker_bridge::Bridge {
+            access: control.tracker_access(),
+            upstream: a.tracker_upstream.clone(),
+            udp: std::sync::Arc::new(udp_upstream::Announcements::new()),
+            ordering: std::sync::Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            selection: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        Some(tokio::spawn(async move {
+            axum::serve(listener, tracker_bridge::router(bridge)).await
+        }))
+    } else {
+        None
+    };
     let adapter = interface::Adapter::new(
         info.virtual_ip,
         a.packet_socket.as_deref(),
@@ -306,6 +374,10 @@ async fn main() -> Result<()> {
         }}
     } Ok(())}.await;
     worker.abort();
+    #[cfg(feature = "bittorrent")]
+    if let Some(bridge) = bridge_server {
+        bridge.abort();
+    }
     mapping.shutdown().await;
     println!(
         "{}",

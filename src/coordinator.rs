@@ -10,6 +10,34 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 type Reply<T> = oneshot::Sender<Result<T>>;
 enum Command {
+    PublishEndpoint {
+        who: Credentials,
+        endpoint: SocketAddr,
+        ttl: u64,
+        reply: Reply<u64>,
+    },
+    PrepareLink {
+        who: Credentials,
+        identity: Key,
+        id: Key,
+        pending: crate::enrollment::Pending,
+        reply: Reply<()>,
+    },
+    FinishLink {
+        who: Credentials,
+        id: Key,
+        answer: Key,
+        reply: Reply<(Key, Vec<Key>)>,
+    },
+    Identity {
+        who: Credentials,
+        reply: Reply<(Key, Vec<Key>)>,
+    },
+    RevokeCredential {
+        who: Credentials,
+        target: Key,
+        reply: Reply<()>,
+    },
     #[cfg(feature = "bittorrent")]
     Torrent {
         who: Credentials,
@@ -104,6 +132,57 @@ pub struct Coordinator {
     commands: mpsc::UnboundedSender<Command>,
 }
 impl Coordinator {
+    pub async fn publish_endpoint(
+        &self,
+        who: Credentials,
+        endpoint: SocketAddr,
+        ttl: u64,
+    ) -> Result<u64> {
+        self.call(|reply| Command::PublishEndpoint {
+            who,
+            endpoint,
+            ttl,
+            reply,
+        })
+        .await
+    }
+    pub(crate) async fn prepare_link(
+        &self,
+        who: Credentials,
+        identity: Key,
+        id: Key,
+        pending: crate::enrollment::Pending,
+    ) -> Result<()> {
+        self.call(|reply| Command::PrepareLink {
+            who,
+            identity,
+            id,
+            pending,
+            reply,
+        })
+        .await
+    }
+    pub(crate) async fn finish_link(
+        &self,
+        who: Credentials,
+        id: Key,
+        answer: Key,
+    ) -> Result<(Key, Vec<Key>)> {
+        self.call(|reply| Command::FinishLink {
+            who,
+            id,
+            answer,
+            reply,
+        })
+        .await
+    }
+    pub async fn identity(&self, who: Credentials) -> Result<(Key, Vec<Key>)> {
+        self.call(|reply| Command::Identity { who, reply }).await
+    }
+    pub async fn revoke_credential(&self, who: Credentials, target: Key) -> Result<()> {
+        self.call(|reply| Command::RevokeCredential { who, target, reply })
+            .await
+    }
     /// Must be called inside a Tokio runtime. Dropping all handles closes the owner task.
     pub fn new(config: Config) -> Arc<Self> {
         Self::with_audience(config, "http://localhost/".into())
@@ -303,6 +382,26 @@ async fn run(
                 let Some(command) = command else { break; };
                 let now = start.elapsed().as_secs();
                 match command {
+                    Command::PublishEndpoint { who, endpoint, ttl, reply } => {
+                        if !reply.is_closed() { let _ = reply.send(registry.publish_endpoint(who, endpoint, ttl, now)); }
+                    },
+                    Command::PrepareLink { who, identity, id, pending, reply } => {
+                        if !reply.is_closed() { let _ = reply.send(registry.prepare_link(who, identity, id, pending, now)); }
+                    },
+                    Command::FinishLink { who, id, answer, reply } => {
+                        if !reply.is_closed() { let result = registry.finish_link(who, id, answer, now).and_then(|_| registry.identity_credentials(who, now)); let _ = reply.send(result); }
+                    },
+                    Command::Identity { who, reply } => {
+                        if !reply.is_closed() { let _ = reply.send(registry.identity_credentials(who, now)); }
+                    },
+                    Command::RevokeCredential { who, target, reply } => {
+                        if !reply.is_closed() {
+                            let result = registry.revoke_credential(who, target, now);
+                            #[cfg(feature = "bittorrent")]
+                            if result.is_ok() { torrents.remove_peer(target); }
+                            let _ = reply.send(result);
+                        }
+                    },
                     #[cfg(feature = "bittorrent")]
                     Command::Torrent { who, request, reply } => {
                         if !reply.is_closed() { let _ = reply.send(crate::bittorrent::execute(&registry, &mut torrents, who, request, now)); }

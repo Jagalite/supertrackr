@@ -37,6 +37,11 @@ pub struct Pending {
     pub answer_hash: [u8; 32],
     pub until: u64,
 }
+/// Domain-separate a credential-link proof from registration and bind it to the
+/// logical owner identity. Pass the result as the audience to `solve`.
+pub fn link_audience(origin: &str, identity: &[u8; 32]) -> String {
+    format!("supertrackr/link/v1:{}:{}", origin, hex::encode(identity))
+}
 fn answer(
     secret: &[u8],
     audience: &str,
@@ -175,6 +180,68 @@ pub async fn register(
         .error_for_status()?
         .json()
         .await?)
+}
+/// Link an already registered WireGuard key using the owner's bearer session
+/// and fresh proof of possession of the added key. The returned group retains
+/// both registrations and their independent leases.
+pub async fn link_registered_wireguard(
+    http: &reqwest::Client,
+    base: &reqwest::Url,
+    owner_key: &str,
+    owner_token: &str,
+    added_secret: &StaticSecret,
+    added_endpoint: SocketAddr,
+) -> Result<crate::IdentityResponse> {
+    let auth = |request: reqwest::RequestBuilder| {
+        request
+            .header("x-peer-key", owner_key)
+            .bearer_auth(owner_token)
+    };
+    let owner: crate::IdentityResponse = auth(http.get(base.join("v1/identity")?))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let mut identity = [0; 32];
+    hex::decode_to_slice(&owner.identity, &mut identity)?;
+    if !owner.wireguard_keys.iter().any(|key| key == owner_key) {
+        return Err("identity response omitted owner key".into());
+    }
+    let client_nonce = rand::random();
+    let request = ChallengeRequest {
+        public_key: hex::encode(WgPublic::from(added_secret).as_bytes()),
+        endpoint: added_endpoint,
+        client_nonce: hex::encode(client_nonce),
+    };
+    let challenge: Challenge = auth(http.post(base.join("v1/identity/link/challenge")?))
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let proof = solve(
+        &challenge,
+        added_secret,
+        added_endpoint,
+        client_nonce,
+        &link_audience(base.as_str(), &identity),
+    )?;
+    let linked: crate::IdentityResponse = auth(http.post(base.join("v1/identity/link")?))
+        .json(&proof)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if linked.identity != owner.identity
+        || !linked.wireguard_keys.contains(&request.public_key)
+        || !linked.wireguard_keys.iter().any(|key| key == owner_key)
+    {
+        return Err("invalid linked identity response".into());
+    }
+    Ok(linked)
 }
 #[cfg(test)]
 mod tests {

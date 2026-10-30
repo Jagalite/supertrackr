@@ -3,6 +3,10 @@
 //! The caller MUST authenticate peer keys and supply their current lease deadline.
 //! All times use the same monotonic seconds clock. Revalidate returned keys against
 //! the coordinator before connecting: revocation is owned by the coordinator.
+pub mod http;
+pub mod standard;
+pub mod udp;
+
 use std::{collections::HashMap, num::NonZeroU16};
 
 pub type PeerKey = [u8; 32];
@@ -49,6 +53,7 @@ impl std::error::Error for Error {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peer {
     pub key: PeerKey,
+    pub application: Option<[u8; 20]>,
     pub port: NonZeroU16,
     pub complete: bool,
     pub expires_at: u64,
@@ -68,9 +73,11 @@ pub struct Stats {
     pub leechers: usize,
 }
 
+type Swarm = HashMap<(PeerKey, Option<[u8; 20]>), Peer>;
+
 pub struct Tracker {
     config: Config,
-    swarms: HashMap<InfoHash, HashMap<PeerKey, Peer>>,
+    swarms: HashMap<InfoHash, Swarm>,
     memberships: usize,
 }
 impl Tracker {
@@ -92,12 +99,21 @@ impl Tracker {
     /// Insert or refresh one membership after external authentication.
     /// Expiry cleanup scans bounded stored state; this is not a high-rate index.
     pub fn announce(&mut self, input: Announce, now: u64) -> Result<(), Error> {
+        self.announce_application(input, None, now)
+    }
+    /// Track separate applications owned by the same authenticated key.
+    pub fn announce_application(
+        &mut self,
+        input: Announce,
+        application: Option<[u8; 20]>,
+        now: u64,
+    ) -> Result<(), Error> {
         if input.lease_expires_at <= now {
             return Err(Error::ExpiredLease);
         }
         self.expire(now);
         let swarm = self.swarms.get(&input.info_hash);
-        let exists = swarm.is_some_and(|s| s.contains_key(&input.key));
+        let exists = swarm.is_some_and(|s| s.contains_key(&(input.key, application)));
         if !exists
             && (self.memberships >= self.config.max_memberships
                 || swarm.is_some_and(|s| s.len() >= self.config.max_peers_per_swarm)
@@ -107,6 +123,7 @@ impl Tracker {
         }
         let peer = Peer {
             key: input.key,
+            application,
             port: input.port,
             complete: input.complete,
             expires_at: input
@@ -116,7 +133,7 @@ impl Tracker {
         self.swarms
             .entry(input.info_hash)
             .or_default()
-            .insert(input.key, peer);
+            .insert((input.key, application), peer);
         if !exists {
             self.memberships += 1;
         }
@@ -124,8 +141,16 @@ impl Tracker {
     }
     /// Caller authenticates the departing key before invoking this operation.
     pub fn stop(&mut self, hash: InfoHash, key: PeerKey) {
+        self.stop_application(hash, key, None);
+    }
+    pub fn stop_application(
+        &mut self,
+        hash: InfoHash,
+        key: PeerKey,
+        application: Option<[u8; 20]>,
+    ) {
         if let Some(swarm) = self.swarms.get_mut(&hash) {
-            if swarm.remove(&key).is_some() {
+            if swarm.remove(&(key, application)).is_some() {
                 self.memberships -= 1;
             }
             if swarm.is_empty() {
@@ -136,9 +161,9 @@ impl Tracker {
     /// Remove all memberships for a revoked identity.
     pub fn remove_peer(&mut self, key: PeerKey) {
         self.swarms.retain(|_, swarm| {
-            if swarm.remove(&key).is_some() {
-                self.memberships -= 1;
-            }
+            let before = swarm.len();
+            swarm.retain(|(owner, _), _| *owner != key);
+            self.memberships -= before - swarm.len();
             !swarm.is_empty()
         });
     }
@@ -160,6 +185,16 @@ impl Tracker {
             .take(limit.min(self.config.max_response_peers))
             .copied()
             .collect()
+    }
+    /// Iterate live memberships in one swarm, bounded by max_peers_per_swarm.
+    /// Callers applying additional identity policy must enforce their own response cap.
+    pub fn active_peers(&self, hash: InfoHash, now: u64) -> impl Iterator<Item = Peer> + '_ {
+        self.swarms
+            .get(&hash)
+            .into_iter()
+            .flat_map(|s| s.values())
+            .filter(move |peer| peer.expires_at > now)
+            .copied()
     }
     pub fn stats(&self, hash: InfoHash, now: u64) -> Stats {
         let mut stats = Stats::default();
@@ -183,6 +218,27 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn applications_of_one_key_have_independent_membership_and_revocation() {
+        let mut tracker = Tracker::new(Config::default()).unwrap();
+        let first = input(1);
+        let mut second = first;
+        second.port = NonZeroU16::new(6882).unwrap();
+        tracker
+            .announce_application(first, Some([1; 20]), 0)
+            .unwrap();
+        tracker
+            .announce_application(second, Some([2; 20]), 0)
+            .unwrap();
+        assert_eq!(tracker.peers(first.info_hash, [9; 32], 20, 0).len(), 2);
+        tracker.stop_application(first.info_hash, first.key, Some([1; 20]));
+        assert_eq!(
+            tracker.peers(first.info_hash, [9; 32], 20, 0)[0].port,
+            second.port
+        );
+        tracker.remove_peer(first.key);
+        assert!(tracker.peers(first.info_hash, [9; 32], 20, 0).is_empty());
+    }
     fn input(key: u8) -> Announce {
         Announce {
             info_hash: InfoHash::V1([1; 20]),
