@@ -452,14 +452,13 @@ async fn announce(State(bridge): State<Arc<Bridge>>, RawQuery(query): RawQuery) 
             // Overlay failures must not prevent an HTTP upstream stop. The
             // timeout may also have interrupted a stop already sent, so this
             // retry can duplicate a stop; stops are idempotent.
-            if request.event == Event::Stopped {
-                if let Some(upstream) = bridge
+            if request.event == Event::Stopped
+                && let Some(upstream) = bridge
                     .upstream
                     .as_ref()
                     .filter(|url| matches!(url.scheme(), "http" | "https"))
-                {
-                    retry_http_stop(&bridge, upstream, &query, &request).await;
-                }
+            {
+                retry_http_stop(&bridge, upstream, &query, &request).await;
             }
             result(http::failure("tracker unavailable"))
         }
