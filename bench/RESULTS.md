@@ -746,3 +746,67 @@ final companion artifact) then executed: 78 tests passed. Workspace/all-target
 Clippy with BitTorrent and warnings denied passed in
 `17ed4d48cc4c4dce97474559897a249a`. Formatting and diff checks passed. Native
 privileged interface routing remains unverified.
+
+## Logical identity and WireGuard credential linking — 2026-10-29
+
+Kyoto workspace test compilation with BitTorrent enabled passed as job
+`b999c309f514438f9530cd9e2e4c188a` (compilation only). Its emitted test
+binaries were subsequently executed through Kyoto as job
+`d6a81fe3a210433cb84d8d1d082a14ea`: 85 tests passed, including identity
+linking, proof replay, revocation, linked swarm selection and a loopback HTTP
+client-helper flow. Default-feature workspace check job
+`3b330f2ca141443493bcb5b4db6cdd45` passed. This does not establish native utun
+routing, live transport key rotation, immediate distributed revocation, or QUIC
+and DTLS support.
+
+The first identity Clippy job `5937106e0adc46e085d1f93f5a9655c2` failed on
+`clippy::collapsible_if` in credential-index cleanup; the source was adjusted
+and a new Clippy job was queued. The 85-test execution above predates that
+style-only adjustment.
+
+After the Clippy style fix, `9a5c2f820e1f4790b2708f24fdda74b0` passed.
+A new workspace test compilation `c4d25439b5a94f63ba2809cb615c8e3a`
+passed, followed by execution of the async userspace suite
+`dc04682b125b4ec9a033ecc8eba237e5`: 10 tests passed. The added test registered
+and linked two WireGuard keys over loopback HTTP, exchanged encrypted datagrams
+to both over loopback UDP, revoked one registration, checked its binding was
+unavailable and exchanged traffic with the remaining credential. This does not
+exercise privileged utun, actual client rekeying of one interface, or instant
+revocation of cached bindings. Clippy including the new test passed as
+`3e1a527e135d4f75af6c53266acb89ba`.
+
+After adding the typed credential index and wrong-key/wrong-audience proof tests,
+workspace test compilation `a802f2078fb94f0281a65ea6df7479e2` and the updated
+API compilation `83d42db778964c02aea8f0086cf4fa26` passed. All emitted test
+binaries then executed in job `622e064dd5ed4705a55bb7686982d7d3`: 86 tests
+passed. Workspace Clippy with BitTorrent and warnings denied passed in
+`57473a1dbc534c64a046f97135d841df`; the default-feature workspace check passed
+in `ecbd27ab61624cea8f44d65866531f06`. These results do not change the native
+utun, in-place rekeying or cached-binding limitations stated above.
+
+## Independent endpoint lifetime — 2026-10-29
+
+Workspace test compilation `b18fcd79e740441499f02c0c5e2496d5` passed; all
+emitted test binaries executed in `eefeaced3fef4031b266dbd0295e77a0` with
+90 tests passed. Coverage includes endpoint expiry without credential expiry,
+publication authorization, peer-list lifetime caps, and queued relay expiry.
+Workspace Clippy with BitTorrent and warnings denied passed in
+`bea1de93dd31431cbb60685e0afa960a`; default-feature workspace check passed in
+`fca53ac3b5ea4f3aa057b10d2d2dc8d1`. These checks do not validate immediate
+recall of previously issued bindings or privileged native utun routing.
+
+The unsupported-credential-type API regression was added after that workspace
+run. Its focused test compilation `58d34d81c68248498040495202324922` passed;
+the API binary then executed in `422ed70e730f43f69c0ef75f41fd252d` with all
+17 tests passing, including rejection of the unsupported type.
+
+## Endpoint review fixes — 2026-10-29
+
+Explicit endpoint settings now survive credential refresh; changed or expired
+endpoints require newly published traversal candidates before peer discovery.
+Kyoto workspace test compilation `0804542db7294c6ca23621042621a56e` passed
+after pressure-related deferrals; emitted binaries executed in
+`71fbaf7df5624c6d84a4266c07d91529`, with 91 tests passing. The default-feature
+workspace check `fa993bc513bc4d1da0793c8b75f0b93f` passed. Clippy job
+`0c15e8bb9dec4481a6b085c3bb12fd9e` initially failed on an unused test variable;
+after its removal, Clippy `f4900a85026c4e91b25f1f8de253e78f` passed.

@@ -67,6 +67,8 @@ identity. It does not hide IP addresses or prevent one party creating many keys.
 Rate limiting and Sybil defenses remain separate, deferred work. Verification
 checks the current registered binding, not endpoint reachability or a live tunnel.
 See [the enrollment protocol](docs/ENROLLMENT.md) for the proof and its boundaries.
+The [identity documentation](docs/IDENTITY-DESIGN.md) describes linking
+multiple WireGuard credentials to one logical peer and its current limitations.
 
 Registrations expire after 300 seconds by default (`--ttl-seconds`, 1–86400).
 Authenticated refresh before expiry extends the lease and can change the endpoint;
